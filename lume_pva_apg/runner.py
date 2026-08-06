@@ -1,5 +1,6 @@
 import logging
 import math
+import numbers
 import os
 import threading
 import time
@@ -67,11 +68,37 @@ class RunnerConfig(TypedDict):
         List of model variables
     protocol : list[str]
         List of supported protocols
+    update_rate : float
+        Length in seconds of the window during which incoming writes are batched
+        into a single ``model.set()``. Zero disables the window: every queued
+        write gets a ``model.set()`` of its own, so one client's write is never
+        merged with another's. Default 0.1.
+    echo_unconfirmed_writes : bool
+        Whether an input PV publishes the requested value before the model has
+        accepted it. True (the default) posts the echo as soon as the write is
+        queued -- and leaves it standing even if the simulation cycle that
+        consumed it failed. False defers the echo until the model has accepted
+        the write and withholds it entirely if the model refused, so the PV
+        keeps the last value the model actually took.
+    alarm_on_refused_write : bool
+        Whether a refused write raises WRITE_ALARM/INVALID_ALARM on the CA PV.
+        Channel Access put-completion carries no failure channel -- it can only
+        ever report success -- so an alarm is the only way to tell a CA client
+        its write did not land. Default False.
+    clamp_writes : bool
+        Whether an incoming write is clamped into the target variable's
+        ``value_range`` before being handed to ``model.set()``. Default False,
+        which passes the requested value through unchanged and leaves any
+        range enforcement to the model.
     """
 
     prefix: str
     variables: dict[str, RunnerVariable]
     protocol: list[str]
+    update_rate: float
+    echo_unconfirmed_writes: bool
+    alarm_on_refused_write: bool
+    clamp_writes: bool
 
 
 class Runner:
@@ -101,14 +128,28 @@ class Runner:
         def put(self, pv: SharedPV, op: ServerOperation):
             if self.ro:
                 op.done(error="Read only PV")
-            else:
-                # Update PVs in simulator
-                self.runner._enqueue(
-                    {self.variable.name: {"value": op.value(), "ts": time.monotonic()}},
-                    done=lambda error: op.done(error=error),
-                )
-                pv.post(op.value())
-                LOG.debug(f"Setting PVA: {self.variable.name} -> {op.value()}")
+                return
+
+            value = self.runner._clamp_write(self.variable, op.value())
+
+            def _complete(error: str | None) -> None:
+                # The echo is the value the model was given, so it may only be
+                # published once the model has taken it. A cycle that failed
+                # left the model on its previous value; publishing the request
+                # anyway would leave the PV advertising a value that was never
+                # applied.
+                if error is None and not self.runner.echo_unconfirmed_writes:
+                    pv.post(value)
+                op.done(error=error)
+
+            # Update PVs in simulator
+            self.runner._enqueue(
+                {self.variable.name: {"value": value, "ts": time.monotonic()}},
+                done=_complete,
+            )
+            if self.runner.echo_unconfirmed_writes:
+                pv.post(value)
+            LOG.debug(f"Setting PVA: {self.variable.name} -> {value}")
 
         def rpc(self, op: ServerOperation):
             op.done()
@@ -150,15 +191,48 @@ class Runner:
                     LOG.info(f"{reason}: Rejected invalid enum value {value} for")
                     return False
                 nv = desc["enums"][value]
+            else:
+                nv = self.runner._clamp_write(var, value)
+                value = nv
 
             # Insert into update queue
-            def _complete_put():
-                self.setParam(reason, value)
+            def _complete_put(error: str | None) -> None:
+                accepted = error is None
+
+                # The echo advertises the value the model was given. A failed
+                # cycle left the model on its previous value, so recording the
+                # request leaves the PV holding a value that never landed.
+                if accepted or self.runner.echo_unconfirmed_writes:
+                    self.setParam(reason, value)
+                if not accepted and self.runner.alarm_on_refused_write:
+                    # Put-completion can only ever report success, so an alarm
+                    # is the sole channel available to tell the client its write
+                    # did not take. Must follow setParam, which recomputes the
+                    # alarm from the value.
+                    self.setParamStatus(
+                        reason, pcaspy.Alarm.WRITE_ALARM, pcaspy.Severity.INVALID_ALARM
+                    )
+
+                # Commit, then signal. A value handed to setParam reaches a
+                # monitoring client only when updatePV is called, so without
+                # this flush a client unblocking on put-completion is told the
+                # write finished while its monitor still carries the value that
+                # write replaced.
+                #
+                # The single unflushed case is a refusal with neither policy
+                # enabled: the value recorded just above was never taken by the
+                # model, and publishing it is the very thing this change
+                # exists to prevent.
+                if accepted or not self.runner.echo_unconfirmed_writes:
+                    self.updatePV(reason)
+                elif self.runner.alarm_on_refused_write:
+                    self.updatePV(reason)
+
                 self.callbackPV(reason)
 
             self.runner._enqueue(
                 {vn: {"value": nv, "ts": time.monotonic()}},
-                done=lambda error: _complete_put(),
+                done=_complete_put,
             )
             return True
 
@@ -212,6 +286,12 @@ class Runner:
         self.supports_pva = "pva" in self.protos
 
         self.update_rate = config.get("update_rate", 0.1)
+
+        # Write-path policy. Every default here reproduces the behaviour of a
+        # runner that sets none of them.
+        self.echo_unconfirmed_writes = bool(config.get("echo_unconfirmed_writes", True))
+        self.alarm_on_refused_write = bool(config.get("alarm_on_refused_write", False))
+        self.clamp_writes = bool(config.get("clamp_writes", False))
 
         # Configure CA environment
         os.environ["EPICS_CA_MAX_ARRAY_BYTES"] = self.config.get("max_array_bytes", 80000000)
@@ -372,6 +452,70 @@ class Runner:
                 "reset": reset,
             }
         )
+
+    def _clamp_write(self, variable: Variable, value: Any) -> Any:
+        """
+        Clamp an incoming write into the variable's ``value_range``.
+
+        A no-op unless the ``clamp_writes`` configuration key is set, so range
+        enforcement stays the model's job by default. Values the range cannot
+        describe -- non-numerics, arrays, a variable with no ``value_range`` --
+        are passed through untouched.
+
+        Applied where the write enters the server rather than where it reaches
+        the model, so the value the client is echoed is the same value the
+        model was given.
+
+        Parameters
+        ----------
+        variable : Variable
+            The variable being written.
+        value : Any
+            The requested value. A p4p ``Value`` is clamped through its
+            ``value`` field, in place; anything else is treated as the raw
+            value.
+
+        Returns
+        -------
+        Any :
+            The clamped value, or `value` unchanged.
+        """
+        if not self.clamp_writes:
+            return value
+
+        if isinstance(value, Value):
+            try:
+                raw = value["value"]
+            except (KeyError, TypeError):
+                return value
+            clamped = self._clamp_scalar(variable, raw)
+            if clamped is not raw:
+                value["value"] = clamped
+            return value
+
+        return self._clamp_scalar(variable, value)
+
+    def _clamp_scalar(self, variable: Variable, value: Any) -> Any:
+        """Clamp a native scalar into `variable`'s ``value_range``."""
+        value_range = getattr(variable, "value_range", None)
+        if value_range is None:
+            return value
+        # bool is a Real, and clamping a boolean into a numeric range is not a
+        # meaningful operation.
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            return value
+
+        low, high = value_range[0], value_range[1]
+        clamped = min(max(value, low), high)
+        if clamped == value:
+            return value
+
+        # An integer variable must stay integral even if its range is not.
+        if isinstance(value, numbers.Integral):
+            clamped = int(clamped)
+
+        LOG.info(f"{variable.name}: clamped write {value} into {tuple(value_range)} -> {clamped}")
+        return clamped
 
     def _add_pv(
         self, pv: str, var: Variable, ro: bool, prefix: str, handler: VariableHandler
@@ -562,16 +706,24 @@ class Runner:
             done_callbacks: list = item["done"]
             reset_requested: bool = item.get("reset", False)
 
-            # Wait for a time window of 'update_rate' seconds to pass before continuing
-            until = time.monotonic() + self.update_rate
-            while time.monotonic() < until:
-                try:
-                    next_update = self.queue.get_nowait()
-                    value_data.update(next_update["values"])
-                    done_callbacks.extend(next_update["done"])
-                    reset_requested = reset_requested or next_update.get("reset", False)
-                except Empty:
-                    pass
+            # Wait for a time window of 'update_rate' seconds to pass before
+            # continuing, batching whatever else arrives into the same cycle.
+            #
+            # An update_rate of zero skips the window entirely: this item is the
+            # whole batch, so each queued write gets a model.set() of its own and
+            # can never be merged with another client's. Writes that arrived
+            # while the previous cycle ran stay queued and are served in order,
+            # one cycle each.
+            if self.update_rate > 0:
+                until = time.monotonic() + self.update_rate
+                while time.monotonic() < until:
+                    try:
+                        next_update = self.queue.get_nowait()
+                        value_data.update(next_update["values"])
+                        done_callbacks.extend(next_update["done"])
+                        reset_requested = reset_requested or next_update.get("reset", False)
+                    except Empty:
+                        pass
 
             new_values = {}
             latest_ts = 0.0

@@ -65,6 +65,40 @@ CA/PVA tools on the command line.
 
 Like model outputs, inputs can be served over CA or PVA, depending on the `Runner` configuration.
 
+### The Write Path
+
+A write to an input PV is queued, applied to the model on the next simulation
+cycle, and only then acknowledged: a `caput -c` or a PVA put with `wait=True`
+stays blocked until the cycle that consumed it has finished. Three properties
+of what happens in between are selectable, and each defaults to the behaviour
+the runner has always had.
+
+`echo_unconfirmed_writes` (default `True`) decides whether an input PV may
+advertise a value the model has not accepted. By default the requested value is
+published immediately on PVA, and recorded on CA whether or not the cycle
+succeeded, so a client reading back an input after a failed cycle can see a
+value the model never took. Set it to `False` and the echo waits for the model
+to accept the write, and is withheld entirely if the model refuses it, leaving
+the PV on the last value that actually landed.
+
+`alarm_on_refused_write` (default `False`) raises `WRITE_ALARM`/`INVALID_ALARM`
+on the CA PV when the model refuses a write. Channel Access put-completion
+carries no failure channel — it can only ever report success — so an alarm is
+the only way to tell a CA client its write did not land. PVAccess reports the
+failure through the put itself and needs no equivalent.
+
+`clamp_writes` (default `False`) clamps a written value into the variable's
+`value_range` before handing it to the model. `LUMEModel.set` does not enforce
+`value_range`, so by default an out-of-range write reaches the model unchanged
+and it is the model's job to reject it. The clamp is applied where the write
+enters the server, so the value echoed back to the client is the same value the
+model was given.
+
+`update_rate` is the length in seconds of the window during which arriving
+writes are batched into a single `model.set()`. Set it to zero and the window
+is skipped: every queued write drives a `model.set()` of its own, so one
+client's write is never merged into another's.
+
 ### Control PVs
 
 The runner always exposes a control PV:
@@ -89,6 +123,9 @@ An example configuration:
     'prefix': 'MY_PV_PREFIX:',
     'update_rate': 0.1, # Update period under which PVs will be batched together into one model.set(). Set to 0 to disable the window.
     'protocol': ['ca', 'pva'], # Serve this as both CA and PVA (the default)
+    'echo_unconfirmed_writes': True, # Echo a written value before the model has accepted it
+    'alarm_on_refused_write': False, # Alarm the CA PV when the model refuses a write
+    'clamp_writes': False, # Clamp a written value into the variable's value_range
     'variables': {
         'input_a': {
             'name': 'input_a',
@@ -126,6 +163,11 @@ distribution retires once the upstream ones are merged and released.
 | Run the test suite from outside the checkout, against the installed distribution | Run from the source tree, the tests import the adjacent package regardless of what the packaging metadata ships, so a packaging mistake cannot fail the build. |
 | Add a job asserting the core install is pure-Python on Linux and macOS | The pure-Python core is a property consumers depend on to provision a host without an EPICS toolchain. Stated only in a comment it decays; the job checks the built wheel is `py3-none-any` and that no transport reaches the environment. |
 | Add a job rejecting direct-URL dependencies in the metadata | PyPI refuses a distribution carrying one, in any extra. Without the gate this is discovered by the release that fails, after the tag is spent. |
+| Flush the input echo before signalling put-completion | pcaspy publishes a value to monitoring clients only when `updatePV` runs, so a client released by put-completion was told its write had finished while its own monitor still carried the value that write replaced. |
+| Withhold the input echo when the model refuses a write (`echo_unconfirmed_writes`) | A failed simulation cycle leaves the model on its previous value, but the requested value is recorded on the input PV regardless, so a read-back reports a value the model never took. Put-completion cannot report the failure, so withholding the echo is the only signal available. |
+| Alarm a refused write (`alarm_on_refused_write`) | Channel Access put-completion ends an asynchronous write with `S_casApp_success` unconditionally; there is no failure channel. An alarm is the only way to tell a CA client its write did not land. |
+| Skip the batching window when `update_rate` is zero | The window was skipped only because its deadline had already elapsed by the time it was tested, making per-write isolation an accident of the clock rather than something the documented `update_rate` of zero guarantees. |
+| Clamp a write into the variable's `value_range` (`clamp_writes`) | `LUMEModel.set` does not enforce `value_range`, so an out-of-range write reaches the model unchallenged and, on failure, costs a whole simulation cycle. Applied at the point the write enters the server, so the echo matches what the model was given. |
 
 ### Fork-local changes
 
