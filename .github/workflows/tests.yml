@@ -1,6 +1,13 @@
 name: Run tests
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # Push and pull_request events do not fire on every repository -- a repository
+  # created as a fork holds them until a maintainer opts in -- and a lane that
+  # cannot be started cannot be certified. A manual trigger is the way to run
+  # this suite on demand regardless.
+  workflow_dispatch:
 
 jobs:
   test:
