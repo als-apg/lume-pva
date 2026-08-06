@@ -17,10 +17,18 @@ from lume.variables import (
     Variable,
 )
 from numpy import ndarray
-from p4p import Type, Value
-from p4p.nt import NTEnum, NTNDArray, NTScalar
 
-from lume_pva.epics import epicsAlarmSeverity, epicsAlarmStatus
+from lume_pva_apg._optional import missing_extra
+from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
+
+# The NormativeTypes value layer is expressed in p4p types, and is used by the
+# CA path as well as the PVA one, so p4p is required by both. See the extras
+# note in the README.
+try:
+    from p4p import Type, Value
+    from p4p.nt import NTEnum, NTNDArray, NTScalar
+except ImportError as exc:
+    raise missing_extra("p4p", "pva", exc) from exc
 
 # torch and lume-torch are optional; the Torch* variable types are only
 # supported when the 'torch' extra is installed.

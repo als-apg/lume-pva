@@ -1,37 +1,32 @@
 name: Lint
+
 on:
   pull_request:
   workflow_dispatch:
   push:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - uses: conda-incubator/setup-miniconda@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          auto-activate: true
-          python-version: 3.12
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
 
       - name: Install pre-commit
-        shell: bash -l {0}
-        run: conda install pre-commit nbconvert
-
-      - name: List Python package versions
-        shell: bash -l {0}
-        run: conda list
-
-      - name: Switch to a temporary branch
-        shell: bash -l {0}
-        run: |
-          git checkout -b _ci_branch_
+        run: uv tool install pre-commit
 
       - name: Run pre-commit on all files
-        shell: bash -l {0}
         env:
           RUFF_OUTPUT_FORMAT: github
         run: |
@@ -39,3 +34,49 @@ jobs:
             --show-diff-on-failure \
             --color=always \
             --all-files
+
+  facility-agnostic:
+    # The package must carry no facility-specific naming, data, or references.
+    # Any match below is a leak and fails the build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check for facility-specific references
+        # A leading separator rather than \b: an underscore is a word
+        # character, so \b never fires inside an identifier -- the exact shape
+        # a real leak takes. The bracket classes deliberately exclude _, which
+        # is what makes an underscore count as a separator.
+        #
+        # The trailing separator is required only of the bare-token branch.
+        # Demanding it of the full form too would miss a run-together
+        # identifier, which is a plausible leak and not a word anyone writes
+        # by accident; leaving it off the bare token is what keeps intervals_
+        # used, normals_used, totals, signals, false, also, salsa and alsatian
+        # from tripping the gate.
+        run: |
+          if grep -rinE '(^|[^a-zA-Z0-9])(als[-_]?u|(als|osprey)([^a-zA-Z0-9]|$))' lume_pva_apg/; then
+            echo "::error::facility-specific reference found in lume_pva_apg/"
+            exit 1
+          fi
+          echo "no facility-specific references found"
+
+  no-vcs-dependencies:
+    # A direct-URL requirement anywhere in the metadata -- including an extra --
+    # makes the project unpublishable to PyPI. Catch it at review time rather
+    # than at the release that discovers it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check for VCS or URL requirements
+        run: |
+          if grep -nE '^\s*"[^"]*@ (git\+|https?:)' pyproject.toml; then
+            echo "::error::direct-URL dependency in pyproject.toml; PyPI rejects these"
+            exit 1
+          fi
+          echo "no direct-URL dependencies found"

@@ -1,5 +1,5 @@
 """
-End-to-end tests for :class:`lume_pva.runner.Runner`.
+End-to-end tests for :class:`lume_pva_apg.runner.Runner`.
 Runner interactions here should be performed using EPICS
 
 Put completion test details:
@@ -49,7 +49,7 @@ from lume.model import LUMEModel
 from lume.variables import ScalarVariable
 from p4p.client.thread import Context
 
-from lume_pva.runner import Runner
+from lume_pva_apg.runner import Runner
 
 # Generous upper bound for any single operation to complete.
 OP_TIMEOUT = 10.0
@@ -248,9 +248,9 @@ def _assert_put_completion(harness: RunnerHandle, putter: Callable[[], None]) ->
 
     # ...so a completion-aware put must still be blocked. If this fires, the
     # client was signalled before the simulation finished (put-completion bug).
-    assert not put_returned.wait(
-        timeout=BLOCK_WINDOW
-    ), "put reported completion before the simulation finished"
+    assert not put_returned.wait(timeout=BLOCK_WINDOW), (
+        "put reported completion before the simulation finished"
+    )
     assert thread.is_alive()
 
     # Let the simulation finish; the put must now complete.

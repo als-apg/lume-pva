@@ -7,28 +7,33 @@ from collections.abc import Callable
 from queue import Empty, Queue
 from typing import Any, TypedDict
 
-import p4p.client.thread
-import p4p.server
-import pcaspy
-import pcaspy.cas
-import pvua
 from lume.model import LUMEModel, Variable
 from lume.variables import ParticleGroupVariable
-from p4p import Type, Value
-from p4p.client.thread import Subscription
-from p4p.nt import NTScalar
-from p4p.server import ServerOperation
-from p4p.server.thread import SharedPV
 
-from lume_pva.variables import VariableHandler, find_variable_handler
+from lume_pva_apg._optional import missing_extra
+
+try:
+    import p4p.server
+    from p4p import Type, Value
+    from p4p.nt import NTScalar
+    from p4p.server import ServerOperation
+    from p4p.server.thread import SharedPV
+except ImportError as exc:
+    raise missing_extra("p4p", "pva", exc) from exc
+
+try:
+    import pcaspy
+    import pcaspy.cas
+except ImportError as exc:
+    raise missing_extra("pcaspy", "ca", exc) from exc
+
+from lume_pva_apg.variables import VariableHandler, find_variable_handler
 
 LOG = logging.getLogger("LumePva")
 logging.getLogger("pcaspy").setLevel(logging.WARNING)
 
-VALID_PV_MODES = ["rw", "ro", "remote"]
-VALID_MODEL_MODES = ["continuous", "snapshot"]
+VALID_PV_MODES = ["rw", "ro"]
 
-DEFAULT_MODEL_MODE = "continuous"
 DEFAULT_PV_MODE = "rw"
 
 
@@ -44,7 +49,6 @@ class RunnerVariable(TypedDict):
         Operation mode of the PV. May be one of:
         - 'ro': Read-only PV served by this server
         - 'rw': Read-write PV served by this server. Errors if Variable.read_only
-        - 'remote': Remote PV living on some other remote machine.
         Default is 'rw'
     """
 
@@ -57,21 +61,14 @@ class RunnerConfig(TypedDict):
     """
     Attributes
     ----------
-    remote_model_mode : str
-        Remote model mode. Determines behavior of this model's remote PVs.
-        - 'continuous': Remote input PVs are updated continuously with PV monitors, and model is evaluated on change.
-        - 'snapshot': Remote input PVs are only updated when the 'SNAPSHOT' PV is poked.
-        Default is 'continuous'
     prefix : str
         Additional prefix to append to PV names. May be None if you don't need any.
-        Remote PVs are unaffected by this setting, this only applies to PVs we are serving.
     variables : Dict[str, RunnerVariable]
         List of model variables
     protocol : list[str]
         List of supported protocols
     """
 
-    remote_model_mode: str
     prefix: str
     variables: dict[str, RunnerVariable]
     protocol: list[str]
@@ -86,7 +83,6 @@ class Runner:
     # List of all output PVs that need to be updated after simulation
     outputs: list[str]
     values: dict[str, Value]
-    subs: dict[str, Subscription]
 
     class Handler:
         """
@@ -125,12 +121,6 @@ class Runner:
             self.runner = runner
 
         def write(self, reason, value) -> bool:
-            if reason == self.runner.snapshot_control_pv:
-                self.runner.take_snapshot()
-                self.setParam(reason, value)
-                self.callbackPV(reason)
-                return True
-
             if reason == self.runner.reset_control_pv:
                 self.runner._enqueue({}, reset=True)
                 self.setParam(reason, value)
@@ -199,17 +189,12 @@ class Runner:
         self.new_values = {}
         self.outputs = []
         self.types = {}
-        self.subs = {}
-        self.context = p4p.client.thread.Context()
         self.providers = {}  # Just for renaming
         self.pvdb = {}  # For pcaspy
-        self.snapshot_pvs = []
         self.pv_to_var: dict[str, str] = {}  # Map pv name -> variable name
         self.var_to_pv = {}
         self.ca_pvs = {}
-        self.snapshot_control_pv = ""
         self.reset_control_pv = ""
-        self.pvua_context = pvua.Context()
         self.ca_server: pcaspy.SimpleServer | None = None
         self.ca_driver: Runner.CaDriver | None = None
 
@@ -225,12 +210,6 @@ class Runner:
         self.protos = self._config.get("protocol", ["ca", "pva"])
         self.supports_ca = "ca" in self.protos
         self.supports_pva = "pva" in self.protos
-
-        # Validate some configuration options
-        if config.get("remote_model_mode", DEFAULT_MODEL_MODE) not in VALID_MODEL_MODES:
-            raise KeyError(
-                f"Model has invalid model mode {config['remote_model_mode']}. Must be one of {VALID_MODEL_MODES}"
-            )
 
         self.update_rate = config.get("update_rate", 0.1)
 
@@ -283,23 +262,14 @@ class Runner:
             self.pv_to_var[pv] = var.name
             self.var_to_pv[var.name] = pv
 
-            if c["mode"] in ["ro", "rw"]:
-                # Generate a PV to be served
-                self._add_pv(
-                    pv,
-                    var,
-                    ro=c["mode"] == "ro",
-                    prefix=self.config.get("prefix", ""),
-                    handler=handler,
-                )
-            else:
-                # Create a client monitor
-                self._add_client(
-                    pv,
-                    var,
-                    monitor=self.config["remote_model_mode"]
-                    == "continuous",  # Use monitor if in continuous mode
-                )
+            # Generate a PV to be served
+            self._add_pv(
+                pv,
+                var,
+                ro=c["mode"] == "ro",
+                prefix=self.config.get("prefix", ""),
+                handler=handler,
+            )
 
         # Create an informational PV (i.e. including list of variables, etc.)
         # Only supported for PVA since it uses structures
@@ -335,7 +305,6 @@ class Runner:
     def generate_config(
         model: LUMEModel,
         prefix: str = "",
-        remote_inputs: bool = False,
         name_transformer: Callable[[Variable, str], str] | None = None,
     ) -> RunnerConfig:
         """
@@ -347,8 +316,6 @@ class Runner:
             Instance of a LUMEModel object
         prefix : str
             PV name prefix
-        remote_inputs : bool
-            When true, model inputs (values not marked as rw) are configured as monitors for remote variables
         name_transformer: Callable[[Variable, str], str] | None
             A callable that transforms a variable's name into a new PV name. by default it just maps variable.name -> pv_name
 
@@ -360,15 +327,12 @@ class Runner:
         """
         config = {
             "description": "",
-            "remote_model_mode": "continuous",
             "prefix": prefix,
             "max_array_bytes": os.environ.get("EPICS_CA_MAX_ARRAY_BYTES", "80000000"),
             "variables": {},
         }
         for k, v in model.supported_variables.items():
             mode = "ro" if v.read_only else "rw"
-            if remote_inputs and not v.read_only:
-                mode = "remote"
             if name_transformer is not None:
                 pv = name_transformer(v, v.name)
             else:
@@ -453,14 +417,6 @@ class Runner:
             # enable async for put-completion
             self.ca_pvs[var.name] = pv
 
-    def _add_client(self, pv: str, var: Variable, monitor: bool) -> bool:
-        """Setup a new monitor for the specified PV"""
-        if monitor:
-            self.subs[pv] = self.pvua_context.monitor(pv, self._monitor_callback)
-        else:
-            self.snapshot_pvs.append(pv)
-        return True
-
     def _create_model_info(self):
         """Creates a model info PV for PVA"""
         pv = "model_info"
@@ -529,27 +485,12 @@ class Runner:
 
     def _create_control_pvs(self):
         """Create any required control PVs"""
-        # Create a snapshot PV and a reset PV. These are used to trigger a snapshot of remote PVs, and to reset the model.
-        snapshot_pvname = f"{self.config['prefix']}SNAPSHOT"
-        self.snapshot_control_pv = snapshot_pvname
-
+        # Create a reset PV, used to reset the model.
         reset_pvname = f"{self.config['prefix']}RESET"
         self.reset_control_pv = reset_pvname
 
-        # Create PVA shared PVs for snapshot and reset if PVA is enabled
+        # Create a PVA shared PV for reset if PVA is enabled
         if self.supports_pva:
-            if snapshot_pvname in self.providers:
-                raise RuntimeError(
-                    f"Fatal name conflict: {snapshot_pvname} for the snapshot PV already exists!"
-                )
-
-            self.providers[snapshot_pvname] = SharedPV(initial=NTScalar("d").wrap(0))
-
-            @self.providers[snapshot_pvname].put
-            def onPut(pv, op):
-                self.take_snapshot()
-                op.done()
-
             if reset_pvname in self.providers:
                 raise RuntimeError(
                     f"Fatal name conflict: {reset_pvname} for the reset PV already exists!"
@@ -565,22 +506,13 @@ class Runner:
                 )
                 op.done()
 
-        # Create CA PVs for snapshot and reset if CA is enabled
+        # Create the CA reset PV if CA is enabled
         if self.supports_ca:
-            if snapshot_pvname in self.pvdb:
-                raise RuntimeError(
-                    f"Fatal name conflict: {snapshot_pvname} for the CA snapshot PV already exists!"
-                )
             if reset_pvname in self.pvdb:
                 raise RuntimeError(
                     f"Fatal name conflict: {reset_pvname} for the CA reset PV already exists!"
                 )
 
-            self.pvdb[snapshot_pvname] = {
-                "type": "int",
-                "value": 0,
-                "asyn": False,
-            }
             self.pvdb[reset_pvname] = {
                 "type": "int",
                 "value": 0,
@@ -588,23 +520,6 @@ class Runner:
             }
 
         return None
-
-    def take_snapshot(self) -> None:
-        """
-        Take a snapshot of the remote PVs, and simulate the model
-        """
-        LOG.debug(f"Snapshot taken for PVs: {self.snapshot_pvs}")
-        new_values = {}
-        for pv in self.snapshot_pvs:
-            new_values[self.pv_to_var[pv]] = {
-                "value": self.pvua_context.get(pv),
-                "ts": time.monotonic(),
-            }
-        self._enqueue(new_values)
-
-    def _monitor_callback(self, pvname, value, **kwargs):
-        """Callback from p4p monitor updates"""
-        self._enqueue({self.pv_to_var[pvname]: {"value": value, "ts": time.monotonic()}})
 
     def _generate_value(self, pv: str, value: Any | None, ts: float | None = None) -> Value:
         """
@@ -711,10 +626,6 @@ class Runner:
                 pv_update_start = time.perf_counter()
                 LOG.debug(f"writing {len(out_values)} PVs")
                 for k, v in out_values.items():
-                    # Avoid attempting to post to client monitors
-                    if k in self.subs:
-                        continue
-
                     # The model may return None for an output; there is nothing
                     # meaningful to post, and passing it downstream would either
                     # silently substitute the variable default (PVA path) or raise

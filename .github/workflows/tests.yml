@@ -9,26 +9,90 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      # Every uv call in this job resolves the matrix interpreter, rather than
+      # whichever one discovery happens to land on. Set at the job level so a
+      # step added later inherits the pin instead of quietly opting out of it.
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          # setuptools_scm derives the version from tags.
+          fetch-depth: 0
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.2.0
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
           cache-dependency-glob: "**/pyproject.toml"
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies and package
+        # The dev extra pulls in ca and pva, so both transports are exercised;
+        # torch is separate because the Torch* variable handlers are only
+        # importable with it.
         run: |
           uv sync --extra dev --extra torch --no-editable
+      - name: Confirm the interpreter matches the matrix
+        # UV_PYTHON only requests a version; this proves we got it. Without it
+        # a matrix that degraded to one interpreter would test the same leg
+        # three times over and stay green.
+        env:
+          EXPECTED: ${{ matrix.python-version }}
+        run: |
+          uv run --no-sync python -c "
+          import os, sys
+          print(sys.version)
+          expected = os.environ['EXPECTED']
+          actual = '.'.join(map(str, sys.version_info[:2]))
+          assert actual == expected, f'expected Python {expected}, got {actual}'
+          "
       - name: List Python package versions
         run: uv pip list
       - name: Run tests
+        # Run from outside the checkout so the tests import the installed
+        # distribution rather than the adjacent source tree -- that is what
+        # makes a packaging mistake fail here.
         working-directory: ${{ runner.temp }}
         run: |
-          uv run --project ${{ github.workspace }} --no-sync pytest --pyargs lume_pva.tests
+          uv run --project ${{ github.workspace }} --no-sync pytest --pyargs lume_pva_apg.tests
+
+  core-is-pure-python:
+    # The core install must resolve from wheels alone on any platform: no
+    # EPICS transport, no compiled extension, no native build. Consumers rely
+    # on this to sync a host environment without an EPICS toolchain present.
+    name: Core install is pure-Python
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Install the core distribution only
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+        run: |
+          uv venv
+          uv pip install --no-build .
+      - name: The package imports without any transport installed
+        run: uv run --no-project python -c "import lume_pva_apg"
+      - name: No transport leaked into the core install
+        run: |
+          installed=$(uv pip list --format=freeze)
+          echo "$installed"
+          if echo "$installed" | grep -iE '^(pcaspy|p4p|pvua|torch)='; then
+            echo "::error::a transport or optional dependency reached the core install"
+            exit 1
+          fi
+          echo "core install carries no transport"

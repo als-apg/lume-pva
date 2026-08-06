@@ -1,13 +1,17 @@
 [build-system]
-requires = ["setuptools>=75.0", "setuptools_scm[toml]"]
+# setuptools>=77 for the PEP 639 SPDX license expression below. Published
+# metadata is immutable once a release lands, so the floor has to be right
+# before the first build rather than after it.
+requires = ["setuptools>=77", "setuptools_scm[toml]>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lume-pva"
-description = ""
+name = "lume-pva-apg"
+description = "EPICS PV serving based on LUMEModel classes"
 readme = "README.md"
 authors = [
-  { name = "SLAC National Accelerator Laboratory"},
+  { name = "SLAC National Accelerator Laboratory" },
+  { name = "Lawrence Berkeley National Laboratory" },
 ]
 keywords = ["machine learning", "accelerator physics"]
 classifiers = [
@@ -15,62 +19,79 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
 ]
 requires-python = ">=3.11"
+# PEP 639: an SPDX expression plus the file, not the deprecated free-text
+# [project.license] table.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# The core install is deliberately pure-Python: no EPICS transport, no
+# compiled extension, so `pip install lume-pva-apg` resolves from wheels on
+# every platform and never triggers a native build. Serving requires at least
+# one transport extra -- see [project.optional-dependencies] below.
 dependencies = [
-    "pydantic",
     "numpy",
-    "pyyaml",
     "lume-base",
-    "pvua @ git+https://github.com/slac-epics/pvua",
-    "pcaspy"
 ]
 dynamic = ["version"]
-[tool.setuptools_scm]
-version_file = "lume_pva/_version.py"
 
 [project.optional-dependencies]
+# Channel Access serving. 0.8.1 is the floor: on 0.8.0 the asynchronous-write
+# path passes a casClientInfo where a casCtx is required, which raises inside
+# the SWIG director and terminates the server process. 0.8.1 fixes it, and the
+# fix depends on a binding (casClientInfo.ctx) that 0.8.0 does not compile, so
+# it cannot be worked around from Python.
+#
+# Deliberately a lower bound rather than an exact pin: 0.8.1 publishes no
+# linux/aarch64 wheel, so arm64 consumers must stay free to build from sdist
+# or to move to a later release that restores the wheel.
+ca = [
+    "pcaspy>=0.8.1",
+]
+# PVAccess serving and the NormativeTypes value layer.
+pva = [
+    "p4p",
+]
 torch = [
     "torch",
-    "lume-torch @ git+https://github.com/lume-science/lume-torch",
+    # Released on PyPI; a direct VCS reference here would make the project
+    # unpublishable, since PyPI rejects direct-URL dependencies in any extra.
+    "lume-torch>=3.0.0",
 ]
 dev = [
     "pre-commit",
-    "p4p",
-    "pyepics",
     "pytest",
+    "pyepics",
+    "lume-pva-apg[ca,pva]",
 ]
 docs = [
     "mkdocs",
     "mkdocstrings",
     "mkdocstrings-python",
     "mkdocs-material",
-    "mkdocs-include-markdown-plugin"
+    "mkdocs-include-markdown-plugin",
 ]
 
 [project.urls]
-Homepage = "https://github.com/lume-science/lume-pva"
-"Bug Tracker" = "https://github.com/lume-science/lume-pva/issues"
+Homepage = "https://github.com/als-apg/lume-pva"
+Repository = "https://github.com/als-apg/lume-pva"
+"Bug Tracker" = "https://github.com/als-apg/lume-pva/issues"
 
-[project.license]
-file = "LICENSE"
-
-[options]
-zip_safe = false
-include_package_data = true
+[tool.setuptools_scm]
+version_file = "lume_pva_apg/_version.py"
 
 [tool.setuptools.packages.find]
-include = [ "lume_pva", ]
+include = ["lume_pva_apg", "lume_pva_apg.*"]
 namespaces = false
 
 [tool.ruff]
 # Reference and defaults: https://docs.astral.sh/ruff/configuration/
-# exclude = []
 line-length = 100
 indent-width = 4
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [
@@ -92,4 +113,4 @@ select = [
 [tool.pytest.ini_options]
 log_cli_level = "info"
 log_level = "debug"
-testpaths = ["lume_pva/tests"]
+testpaths = ["lume_pva_apg/tests"]

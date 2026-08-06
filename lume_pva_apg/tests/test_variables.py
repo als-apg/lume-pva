@@ -1,4 +1,4 @@
-"""Tests for the variable handlers in lume_pva.variables.
+"""Tests for the variable handlers in lume_pva_apg.variables.
 
 These tests exercise the public handler interface (create_type, pack_value,
 unpack_value, default_value, value_to_native, native_to_value, is_supported,
@@ -23,8 +23,8 @@ from lume.variables import (
 from lume_torch.variables import TorchNDVariable, TorchScalarVariable
 from p4p import Type
 
-from lume_pva.epics import epicsAlarmSeverity, epicsAlarmStatus
-from lume_pva.variables import (
+from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
+from lume_pva_apg.variables import (
     EnumVariableHandler,
     NDVariableHandler,
     ScalarVariableHandler,

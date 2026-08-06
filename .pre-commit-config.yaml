@@ -2,9 +2,8 @@
 # See https://pre-commit.com/hooks.html for more hooks
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks.git
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
-      - id: no-commit-to-branch
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-ast
@@ -12,15 +11,15 @@ repos:
       - id: check-json
       - id: check-merge-conflict
       - id: check-symlinks
+      - id: check-toml
       - id: check-xml
       - id: check-yaml
-        exclude: "^(python/versioneer.py|python/src/_version.py)$"
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.7.0
+    rev: v0.15.1
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
-        types_or: [python, pyi, jupyter]
+        types_or: [python, pyi]
       - id: ruff-format
-        types_or: [python, pyi, jupyter]
+        types_or: [python, pyi]

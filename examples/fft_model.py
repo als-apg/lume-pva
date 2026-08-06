@@ -4,8 +4,7 @@ import numpy as np
 from lume.model import LUMEModel
 from lume.variables import NDVariable, ScalarVariable
 
-from lume_pva.runner import Runner
-from lume_pva.simulator import SimpleSimulator
+from lume_pva_apg.runner import Runner
 
 
 class FFTModel(LUMEModel):
@@ -160,39 +159,10 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG if args.v else logging.INFO)
 
-    sim = SimpleSimulator(
-        pvs={
-            "signal_a": {
-                "type": "array1d",
-                "mode": "expr",
-                "expr": "4*sin(2*pi*t)",
-                "rate": 0.1,
-                "nvalues": 1024,
-            },
-            "signal_b": {
-                "type": "array1d",
-                "mode": "expr",
-                "expr": "2.1*sin(4.3*pi*t)",
-                "rate": 0.1,
-                "nvalues": 1024,
-            },
-            "signal_c": {
-                "type": "array1d",
-                "mode": "expr",
-                "expr": "3.3*sin(0.5544*pi*t)",
-                "rate": 0.1,
-                "nvalues": 1024,
-            },
-        }
-    )
-
     model = FFTModel()
     config = Runner.generate_config(model)
 
-    config["remote_model_mode"] = "continuous"
-
-    for k in ["signal_a", "signal_b", "signal_c"]:
-        config["variables"][k]["mode"] = "remote"
-
+    # signal_a, signal_b and signal_c are served as writable PVs; drive them
+    # with pvput/caput to see the transform update.
     runner = Runner(model=model, config=config)
     runner.run()

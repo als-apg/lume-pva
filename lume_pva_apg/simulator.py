@@ -6,10 +6,20 @@ import time
 from typing import Any, ClassVar
 
 import numpy as np
-import pcaspy
-from p4p.nt import NTNDArray, NTScalar
-from p4p.server import Server
-from p4p.server.thread import SharedPV
+
+from lume_pva_apg._optional import missing_extra
+
+try:
+    from p4p.nt import NTNDArray, NTScalar
+    from p4p.server import Server
+    from p4p.server.thread import SharedPV
+except ImportError as exc:
+    raise missing_extra("p4p", "pva", exc) from exc
+
+try:
+    import pcaspy
+except ImportError as exc:
+    raise missing_extra("pcaspy", "ca", exc) from exc
 
 
 class SimpleSimulator:

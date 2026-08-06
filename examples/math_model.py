@@ -10,8 +10,7 @@ from lume.variables import (
     StrVariable,
 )
 
-from lume_pva.runner import Runner
-from lume_pva.simulator import SimpleSimulator
+from lume_pva_apg.runner import Runner
 
 
 class SimpleMathModel(LUMEModel):
@@ -150,13 +149,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", action="store_true", help="Enable verbose logging")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["local", "remote", "snapshot"],
-        default="local",
-        help="Mode to run the test in",
-    )
     args = parser.parse_args()
 
     # Configure logging for debug if requested
@@ -164,43 +156,13 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG if args.v else logging.INFO)
 
-    # If running in auto mode, provision a dummy server that gives random values for PVs
-    if args.mode in ["snapshot", "remote"]:
-        sim = SimpleSimulator(
-            pvs={
-                "input_a": {
-                    "type": "float",
-                    "mode": "random_uniform",
-                    "range": [-100, 100],
-                    "rate": 0.12,
-                },
-                "input_b": {
-                    "type": "float",
-                    "mode": "expr",
-                    "expr": "10*sin(0.5 * t)",
-                    "rate": 0.05,
-                },
-                "input_c": {
-                    "type": "float",
-                    "mode": "expr",
-                    "expr": "10*sin(0.325 * t)",
-                    "rate": 0.09,
-                },
-                "input_d": {"type": "float", "mode": "expr", "expr": "10*t", "rate": 1},
-            }
-        )
-
     model = SimpleMathModel()
     config = Runner.generate_config(model)
 
     config["description"] = "Simple math model demonstrating a number of variable types"
 
     config["update_rate"] = 1  # Update once per second
-    config["remote_model_mode"] = "continuous" if args.mode == "remote" else "snapshot"
 
-    if args.mode in ["remote", "snapshot"]:
-        for k in ["input_a", "input_b", "input_c"]:
-            config["variables"][k]["mode"] = "remote"
-
+    # Inputs are served as writable PVs; drive them with pvput/caput.
     runner = Runner(model=model, config=config)
     runner.run()

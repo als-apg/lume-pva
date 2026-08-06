@@ -1,6 +1,6 @@
 import time
 
-from lume_pva.simulator import SimpleSimulator
+from lume_pva_apg.simulator import SimpleSimulator
 
 if __name__ == "__main__":
     sim = SimpleSimulator(
