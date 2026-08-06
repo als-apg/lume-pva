@@ -9,24 +9,24 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     env:
       # Every uv call in this job resolves the matrix interpreter, rather than
       # whichever one discovery happens to land on. Set at the job level so a
       # step added later inherits the pin instead of quietly opting out of it.
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # setuptools_scm derives the version from tags.
           fetch-depth: 0
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
           cache-dependency-glob: "**/pyproject.toml"
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies and package
@@ -38,7 +38,7 @@ jobs:
       - name: Confirm the interpreter matches the matrix
         # UV_PYTHON only requests a version; this proves we got it. Without it
         # a matrix that degraded to one interpreter would test the same leg
-        # three times over and stay green.
+        # four times over and stay green.
         env:
           EXPECTED: ${{ matrix.python-version }}
         run: |
@@ -71,20 +71,36 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
           cache-dependency-glob: "**/pyproject.toml"
+      - name: Build the wheel
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+        run: uv build --wheel
+      - name: The wheel is platform-independent
+        # A compiled extension would make setuptools tag the wheel with an ABI
+        # and a platform. py3-none-any is the property consumers depend on.
+        run: |
+          ls dist/
+          if ! ls dist/ | grep -q -- '-py3-none-any\.whl$'; then
+            echo "::error::wheel is not py3-none-any; the build produced a platform artifact"
+            exit 1
+          fi
       - name: Install the core distribution only
+        # --no-build installs the pre-built wheel and forbids falling back to a
+        # source build for anything it pulls in, so a dependency without a
+        # wheel for this platform fails here rather than silently compiling.
         env:
           UV_PYTHON: ${{ matrix.python-version }}
         run: |
           uv venv
-          uv pip install --no-build .
+          uv pip install --no-build dist/*.whl
       - name: The package imports without any transport installed
         run: uv run --no-project python -c "import lume_pva_apg"
       - name: No transport leaked into the core install

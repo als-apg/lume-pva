@@ -123,12 +123,17 @@ distribution retires once the upstream ones are merged and released.
 | Adopt the PEP 639 SPDX licence expression and drop the deprecated `[project.license]` table | Published metadata is immutable, so the deprecated form has to go before a release rather than after one. |
 | Drop `pydantic` and `pyyaml` from the dependency list | Neither is imported anywhere in the package. |
 | Move CI from conda to `uv`, pin the interpreter per matrix leg, and assert it at runtime | A matrix that silently degrades to one interpreter tests the same leg repeatedly and stays green. |
+| Run the test suite from outside the checkout, against the installed distribution | Run from the source tree, the tests import the adjacent package regardless of what the packaging metadata ships, so a packaging mistake cannot fail the build. |
+| Add a job asserting the core install is pure-Python on Linux and macOS | The pure-Python core is a property consumers depend on to provision a host without an EPICS toolchain. Stated only in a comment it decays; the job checks the built wheel is `py3-none-any` and that no transport reaches the environment. |
+| Add a job rejecting direct-URL dependencies in the metadata | PyPI refuses a distribution carrying one, in any extra. Without the gate this is discovered by the release that fails, after the tag is spent. |
 
 ### Fork-local changes
 
 | Change | Rationale |
 | --- | --- |
 | Import package renamed to `lume_pva_apg`, distribution to `lume-pva-apg` | Two distributions cannot share an import package; the rename is what makes the two installable side by side. Retired when the fork is. |
+| CI job failing on a facility-specific reference in the package | The staging fork is edited alongside a facility deployment, which is exactly the condition under which a site-specific name gets committed by accident. The gate keeps every change here shaped as something upstream can take. |
+| Dropped the `no-commit-to-branch` pre-commit hook | Changes land on `main` here before they are proposed upstream, so the hook blocks the fork's only workflow. |
 | Removed the `pvua` dependency and the remote-input mode it backed | `pvua` is only available as a VCS reference, which makes the project unpublishable, and the remote mode is unused here. Dropped rather than reworked: upstream owns `pvua` and should keep the feature, so this is not offered as a pull request. |
 
 Removing the remote-input mode also removed what depended on it: the `remote`
