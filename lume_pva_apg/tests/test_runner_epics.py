@@ -160,7 +160,13 @@ class GatedModel(LUMEModel):
         self._state = {"input_a": 0.0, "sum_output": 0.0}
 
 
-def _serve(release: mpEvent, entered: mpEvent, completed: mpEvent, ready: mpEvent) -> None:
+def _serve(
+    release: mpEvent,
+    entered: mpEvent,
+    completed: mpEvent,
+    ready: mpEvent,
+    echo_unconfirmed_writes: bool = True,
+) -> None:
     """Child-process entry point: serve a gated model over CA and PVA.
 
     Must be importable at module top level so the ``spawn`` start method can
@@ -170,6 +176,7 @@ def _serve(release: mpEvent, entered: mpEvent, completed: mpEvent, ready: mpEven
     config = Runner.generate_config(model)
     # No batching delay -- the cycle is driven purely by the gate.
     config["update_rate"] = 0.0
+    config["echo_unconfirmed_writes"] = echo_unconfirmed_writes
 
     # Let the implicit startup cycle (Runner.__init__ enqueues an empty update)
     # pass freely before the parent arms the gate.
@@ -194,10 +201,13 @@ class RunnerHandle:
     release: mpEvent
     entered: mpEvent
     completed: mpEvent
+    # The echo mode the served Runner was configured with, so a test can
+    # assert the contract that mode actually promises.
+    echo_unconfirmed_writes: bool
 
 
 @pytest.fixture(scope="function")
-def harness() -> Generator[RunnerHandle, None, None]:
+def harness(request: pytest.FixtureRequest) -> Generator[RunnerHandle, None, None]:
     """
     Run a Runner in a child process and yield the shared gate + a PVA client.
 
@@ -212,9 +222,13 @@ def harness() -> Generator[RunnerHandle, None, None]:
     completed = _MP.Event()
     ready = _MP.Event()
 
+    # Indirect parametrization selects the echo mode; unparametrized uses of
+    # the fixture serve the Runner default (echo_unconfirmed_writes=True).
+    echo_unconfirmed_writes = getattr(request, "param", True)
+
     proc = _MP.Process(
         target=_serve,
-        args=(release, entered, completed, ready),
+        args=(release, entered, completed, ready, echo_unconfirmed_writes),
         daemon=True,
     )
     proc.start()
@@ -224,6 +238,7 @@ def harness() -> Generator[RunnerHandle, None, None]:
         release=release,
         entered=entered,
         completed=completed,
+        echo_unconfirmed_writes=echo_unconfirmed_writes,
     )
     try:
         yield handle
@@ -314,27 +329,55 @@ def test_standard_sim(harness: RunnerHandle):
     assert read_ca("input_a") == pytest.approx(10.0)
 
 
+@pytest.mark.parametrize(
+    "harness",
+    [True, False],
+    indirect=True,
+    ids=["echo-unconfirmed", "echo-withheld"],
+)
 def test_failed_sim(harness: RunnerHandle):
-    assert harness.completed.is_set()
     # Assert initial state
     assert read_ca("input_a") == pytest.approx(0.0)
     assert read_ca("sum_output") == pytest.approx(0.0)
 
-    # Reasonable input
+    # Reasonable input. Clear the completion event first so the wait below can
+    # only be satisfied by the cycle this put triggers, not a leftover from
+    # startup.
+    harness.completed.clear()
     epics.caput("input_a", 4.2, wait=True)
-
-    # Verify record has processed
-    assert harness.completed.is_set()
+    assert harness.completed.wait(timeout=OP_TIMEOUT)
     assert read_ca("input_a") == pytest.approx(4.2)
     assert read_ca("sum_output") == pytest.approx(8.4)
 
-    # attempt set out of bounds
+    # Attempt a set out of bounds. The model refuses it and the runner reverts
+    # to the cached pre-put state -- and that revert is itself a full gated
+    # model.set() cycle, so waiting on `completed` observes the revert
+    # finishing before anything is asserted.
+    harness.completed.clear()
     epics.caput("input_a", 7.0e6, wait=True)
+    assert harness.completed.wait(timeout=OP_TIMEOUT)
 
-    # reverting to previous (cached) value, runner is still operational
-    assert harness.completed.is_set()
-    assert read_ca("input_a") == pytest.approx(4.2)
+    # What the input PV now reads off the wire is the echo contract, not the
+    # model state. The default (echo_unconfirmed_writes=True) posts the
+    # requested value when the write is queued and leaves it standing even
+    # though the cycle that consumed it failed; echo_unconfirmed_writes=False
+    # withholds the echo, so the PV keeps the last value the model accepted.
+    if harness.echo_unconfirmed_writes:
+        assert read_ca("input_a") == pytest.approx(7.0e6)
+    else:
+        assert read_ca("input_a") == pytest.approx(4.2)
+
+    # In both modes the failed cycle posts no outputs and the model reverts,
+    # so the output PV still carries the last good cycle's value: the runner
+    # is still operational.
     assert read_ca("sum_output") == pytest.approx(8.4)
+
+    # And a subsequent valid write goes through normally on the same runner.
+    harness.completed.clear()
+    epics.caput("input_a", 2.0, wait=True)
+    assert harness.completed.wait(timeout=OP_TIMEOUT)
+    assert read_ca("input_a") == pytest.approx(2.0)
+    assert read_ca("sum_output") == pytest.approx(4.0)
 
 
 def test_pva_reset_calls_model_reset(harness: RunnerHandle) -> None:
