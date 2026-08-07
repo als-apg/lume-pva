@@ -629,8 +629,6 @@ def test_raise_packing_invalid_value(
                 "type": "float",
                 "lolim": 0,
                 "hilim": 0,
-                "lolo": 0,
-                "hihi": 0,
             },
             id="scalar_no_extras",
         ),

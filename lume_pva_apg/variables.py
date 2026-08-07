@@ -334,13 +334,27 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable]):
             type_ = "int"
         else:
             type_ = "float"
+        # value_range is the variable's operating range, so it is published as
+        # the display limits and nothing else. pcaspy's lolo/hihi are *alarm*
+        # thresholds, compared with <= and >=, so deriving them from the same
+        # range puts a value driven to either end of its own legal span into
+        # MAJOR alarm -- where the PVA path, which compares strictly, reports
+        # NO_ALARM for that same value.
+        #
+        # Omitting them rather than zeroing them is what disables the check:
+        # pcaspy evaluates a numeric alarm only where lolo < hihi holds, and
+        # an explicit pair of zeros is still a defined threshold.
+        #
+        # The two transports now agree at the limit, which is the value an
+        # operating range is actually driven to. They still differ strictly
+        # outside it, where PVA reports MAJOR and CA reports nothing: pcaspy's
+        # inclusive comparison cannot express a threshold that alarms outside
+        # the range without also alarming at it.
         return {
             "unit": variable.unit,
             "type": type_,
             "lolim": value_range[0],
             "hilim": value_range[1],
-            "lolo": value_range[0],
-            "hihi": value_range[1],
         }
 
 

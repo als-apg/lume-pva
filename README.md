@@ -168,6 +168,7 @@ distribution retires once the upstream ones are merged and released.
 | Alarm a refused write (`alarm_on_refused_write`) | Channel Access put-completion ends an asynchronous write with `S_casApp_success` unconditionally; there is no failure channel. An alarm is the only way to tell a CA client its write did not land. |
 | Skip the batching window when `update_rate` is zero | The window was skipped only because its deadline had already elapsed by the time it was tested, making per-write isolation an accident of the clock rather than something the documented `update_rate` of zero guarantees. |
 | Clamp a write into the variable's `value_range` (`clamp_writes`) | `LUMEModel.set` does not enforce `value_range`, so an out-of-range write reaches the model unchallenged and, on failure, costs a whole simulation cycle. Applied at the point the write enters the server, so the echo matches what the model was given. |
+| Publish `value_range` as CA display limits only, not as alarm thresholds | pcaspy compares `lolo`/`hihi` with `<=`/`>=`, so thresholds taken from the variable's own range put a value driven to either end of its legal span into MAJOR alarm — where the PVA path, which compares strictly, reports no alarm for the same value. This does not preserve the old behaviour for a value *outside* the range, which no longer alarms on CA at all; pcaspy's inclusive comparison cannot express a threshold that alarms outside the range without also alarming at it. |
 | Apply the PV name prefix exactly once on the Channel Access path | `prefix` was written into the pvdb keys and then applied again by `SimpleServer.createPV`, so a runner configured with `PFX:` served `PFX:PFX:name`. The driver names a PV by its pvdb key, so the same mistake left the cycle's output pass calling `setParam` with a name the database did not hold: every cycle raised `KeyError` and was logged as a failed simulation. Keying the database by base name leaves the prefix to the server, which is also what names a PV in every driver callback. Invisible at `prefix=""`, which is what every existing test used. |
 
 ### Fork-local changes
@@ -200,8 +201,15 @@ Supported metadata:
     * `ScalarVariable.value_range[0]`
 * `control.limitHigh`
     * `ScalarVariable.value_range[1]`
-* `alarm.severity` and `alarm.status`
-    * Set based on the value in relation to `value_range`. Out of range values trigger alarms.
+* `alarm.severity` and `alarm.status` (PVA only)
+    * Set from the value's position relative to `value_range`: a value strictly outside it is a MAJOR alarm, a value anywhere within it — including at either limit — is no alarm.
+
+On CA, `value_range` is served as the display limits (`lolim`/`hilim`) and is
+not served as an alarm threshold. pcaspy compares its `lolo`/`hihi` thresholds
+inclusively, so a range published as an alarm limit puts a value driven to
+either end of its own legal span into MAJOR alarm. A CA client therefore sees
+no range-derived alarm at all, while a PVA client still sees one for a value
+outside the range.
 
 ### `NDVariable`
 

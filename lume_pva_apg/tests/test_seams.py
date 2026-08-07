@@ -1,4 +1,5 @@
-"""Tests for :class:`lume_pva_apg.runner.Runner` served under a PV name prefix.
+"""Tests for the names and the metadata a :class:`lume_pva_apg.runner.Runner`
+puts on the wire.
 
 The CA database is keyed by base PV name and prefixed exactly once, by
 ``SimpleServer.createPV``, and that same base name is what names a PV in every
@@ -10,6 +11,9 @@ tables cannot resolve.
 Every server here therefore runs under a non-empty ``prefix``. A suite run
 entirely at ``prefix=""`` cannot tell a singly-applied prefix from a doubly
 applied one, nor an output pass that resolves its names from one that does not.
+
+The metadata tests cover what a variable's ``value_range`` becomes on the CA
+side: display limits, and not an alarm threshold.
 
 Runners are started in independent subprocesses so each test gets a fresh
 server and a fresh configuration. Each server takes a prefix of its own, so no
@@ -162,6 +166,24 @@ def _put(name: str, value: Any) -> None:
     assert rc == 1, f"caput on {name} did not complete (rc={rc})"
 
 
+def _ctrlvars(name: str) -> dict[str, Any]:
+    pv = epics.get_pv(name, timeout=OP_TIMEOUT)
+    assert pv.wait_for_connection(timeout=OP_TIMEOUT), f"{name} never connected"
+    return pv.get_ctrlvars(timeout=OP_TIMEOUT)
+
+
+def _severity(name: str) -> tuple[int, int]:
+    """Return (severity, status) as the server currently reports them."""
+    pv = epics.get_pv(name, timeout=OP_TIMEOUT)
+    pv.get(use_monitor=False, timeout=OP_TIMEOUT)
+    return pv.severity, pv.status
+
+
+# --------------------------------------------------------------------------
+# (a) the prefix reaches the wire exactly once, on both halves of the CA path
+# --------------------------------------------------------------------------
+
+
 def test_ca_names_are_prefixed_exactly_once(serve) -> None:
     """Every served CA name carries the prefix once, and nothing carries it twice.
 
@@ -213,3 +235,47 @@ def test_prefixed_output_pass_completes_the_cycle(serve) -> None:
     # The echo was withheld on a failed cycle, so its presence is independent
     # evidence that the cycle succeeded.
     assert _read(f"{prefix}{IN_A}") == pytest.approx(4.0)
+
+
+# --------------------------------------------------------------------------
+# (b) ca_pvspec publishes value_range as display limits and nothing else
+# --------------------------------------------------------------------------
+
+
+def test_value_range_is_published_as_display_limits_only(serve) -> None:
+    """``value_range`` describes the operating range, not an alarm threshold.
+
+    pcaspy evaluates a numeric alarm only where ``lolo < hihi`` and
+    ``low < high`` hold, so leaving all four unset -- rather than setting them
+    to zero, which would still leave them defined -- is what takes the range
+    out of the alarm calculation.
+    """
+    prefix = serve()
+
+    ctrl = _ctrlvars(f"{prefix}{IN_A}")
+
+    assert ctrl["lower_disp_limit"] == pytest.approx(RANGE[0])
+    assert ctrl["upper_disp_limit"] == pytest.approx(RANGE[1])
+    assert ctrl["units"] == UNIT
+    for key in (
+        "lower_alarm_limit",
+        "upper_alarm_limit",
+        "lower_warning_limit",
+        "upper_warning_limit",
+    ):
+        assert ctrl[key] == pytest.approx(0.0), f"{key} is still an alarm threshold"
+
+
+def test_a_value_at_its_own_limit_is_not_in_alarm(serve) -> None:
+    """pcaspy compares with ``<=``/``>=``, so an alarm threshold taken from the
+    variable's own range puts a value driven to either end of its legal span
+    into MAJOR alarm."""
+    prefix = serve()
+
+    _put(f"{prefix}{IN_A}", RANGE[1])
+    assert _read(f"{prefix}{IN_A}") == pytest.approx(RANGE[1])
+    assert _severity(f"{prefix}{IN_A}") == (0, 0)
+
+    _put(f"{prefix}{IN_A}", RANGE[0])
+    assert _read(f"{prefix}{IN_A}") == pytest.approx(RANGE[0])
+    assert _severity(f"{prefix}{IN_A}") == (0, 0)
