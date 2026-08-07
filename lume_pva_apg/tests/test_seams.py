@@ -1,5 +1,5 @@
-"""Tests for the names and the metadata a :class:`lume_pva_apg.runner.Runner`
-puts on the wire.
+"""Tests for the names, the metadata and the extension points a
+:class:`lume_pva_apg.runner.Runner` puts on the wire.
 
 The CA database is keyed by base PV name and prefixed exactly once, by
 ``SimpleServer.createPV``, and that same base name is what names a PV in every
@@ -14,6 +14,14 @@ applied one, nor an output pass that resolves its names from one that does not.
 
 The metadata tests cover what a variable's ``value_range`` becomes on the CA
 side: display limits, and not an alarm threshold.
+
+The remaining tests cover the four seams a subclass builds on -- ``_extend_pvdb``,
+``ca_driver_cls``, ``_post_outputs`` and the ``control_pvs`` configuration key.
+Each is asserted through EPICS rather than through the object: a hook that is
+called but whose result never reaches a client is not a seam. Where the base
+class already does something similar -- serving a PV, publishing an output --
+a runner *without* the override is served alongside as a negative control, so
+the assertions distinguish the seam from what the base class does anyway.
 
 Runners are started in independent subprocesses so each test gets a fresh
 server and a fresh configuration. Each server takes a prefix of its own, so no
@@ -45,6 +53,7 @@ import epics
 from lume.model import LUMEModel
 from lume.variables import ScalarVariable
 from p4p.client.thread import Context
+from p4p.client.thread import TimeoutError as PvaTimeoutError
 
 from lume_pva_apg.runner import RESET_CONTROL_PV, Runner
 
@@ -59,6 +68,17 @@ ABSENT_TIMEOUT = 3.0
 # prefix on the wire.
 IN_A = "in_a"
 OUT_DOUBLE = "out_double"
+# Contributed by _extend_pvdb, and known to no model.
+EXTRA_PV = "EXTRA"
+# Also contributed by _extend_pvdb, and written by the _post_outputs override.
+MIRROR_PV = "MIRROR"
+# What the seam driver does to a value written to EXTRA_PV. The stock driver
+# resolves a reason through the model's variables, so it refuses EXTRA_PV
+# outright; any non-zero readback can only have come from the override.
+EXTRA_GAIN = 2.0
+# What the _post_outputs override adds to the output it mirrors, so a mirrored
+# value cannot be confused with the output itself.
+MIRROR_OFFSET = 1.0
 
 RANGE = (-10.0, 10.0)
 UNIT = "mm"
@@ -102,7 +122,63 @@ class SeamModel(LUMEModel):
         self.started.set()
 
 
-def _serve(prefix: str, overrides: dict[str, Any], started: mpEvent, ready: mpEvent) -> None:
+def _extra_entries() -> dict[str, dict[str, Any]]:
+    """The pvdb entries a subclass contributes, keyed by base PV name."""
+    return {
+        EXTRA_PV: {"type": "float", "value": 0.0},
+        MIRROR_PV: {"type": "float", "value": 0.0},
+    }
+
+
+class ExtendOnlyRunner(Runner):
+    """Contributes PVs and nothing else.
+
+    The negative control for the driver and output seams: it serves the same
+    two extra PVs, so a difference in how they behave is attributable to the
+    seam under test rather than to their presence.
+    """
+
+    def _extend_pvdb(self) -> dict[str, dict[str, Any]]:
+        return _extra_entries()
+
+
+class SeamRunner(ExtendOnlyRunner):
+    """A subclass built out of every seam, the way a consumer would build one."""
+
+    class SeamDriver(Runner.CaDriver):
+        """Serves EXTRA_PV, a reason the stock driver would refuse."""
+
+        def write(self, reason: str, value: Any) -> bool:
+            if reason == EXTRA_PV:
+                self.setParam(reason, value * EXTRA_GAIN)
+                self.updatePV(reason)
+                return True
+            return super().write(reason, value)
+
+    ca_driver_cls = SeamDriver
+
+    def _post_outputs(self, out_values: dict[str, Any], ts: float) -> None:
+        # Published before delegating, so the base implementation's updatePVs
+        # flushes this alongside the model's own outputs.
+        if self.ca_driver is not None:
+            self.ca_driver.setParam(MIRROR_PV, float(out_values[OUT_DOUBLE]) + MIRROR_OFFSET)
+        super()._post_outputs(out_values, ts)
+
+
+_RUNNERS: dict[str, type[Runner]] = {
+    "stock": Runner,
+    "extend_only": ExtendOnlyRunner,
+    "seam": SeamRunner,
+}
+
+
+def _serve(
+    prefix: str,
+    runner_key: str,
+    overrides: dict[str, Any],
+    started: mpEvent,
+    ready: mpEvent,
+) -> None:
     """Child-process entry point: serve a SeamModel under `prefix`.
 
     Must be importable at module top level so the ``spawn`` start method can
@@ -113,7 +189,7 @@ def _serve(prefix: str, overrides: dict[str, Any], started: mpEvent, ready: mpEv
     config["update_rate"] = 0.0
     config.update(overrides)
 
-    runner = Runner(model=model, config=config)
+    runner = _RUNNERS[runner_key](model=model, config=config)
     threading.Thread(target=runner._run, daemon=True).start()
 
     # Runner.__init__ enqueues an empty update; wait for that cycle to land so
@@ -129,11 +205,13 @@ def serve() -> Generator[Callable[..., str], None, None]:
     """Yield a factory that starts a configured Runner and returns its prefix."""
     procs: list[Any] = []
 
-    def _start(**overrides: Any) -> str:
+    def _start(runner_key: str = "stock", **overrides: Any) -> str:
         prefix = f"SEAM{next(_TAGS)}:"
         started = _MP.Event()
         ready = _MP.Event()
-        proc = _MP.Process(target=_serve, args=(prefix, overrides, started, ready), daemon=True)
+        proc = _MP.Process(
+            target=_serve, args=(prefix, runner_key, overrides, started, ready), daemon=True
+        )
         proc.start()
         procs.append(proc)
         assert ready.wait(timeout=OP_TIMEOUT), "child Runner never became ready"
@@ -279,3 +357,148 @@ def test_a_value_at_its_own_limit_is_not_in_alarm(serve) -> None:
     _put(f"{prefix}{IN_A}", RANGE[0])
     assert _read(f"{prefix}{IN_A}") == pytest.approx(RANGE[0])
     assert _severity(f"{prefix}{IN_A}") == (0, 0)
+
+
+# --------------------------------------------------------------------------
+# (c) _extend_pvdb: a subclass's entries are served
+# --------------------------------------------------------------------------
+
+
+def test_extend_pvdb_entries_are_served(serve) -> None:
+    prefix = serve("extend_only")
+
+    assert _read(f"{prefix}{EXTRA_PV}") == pytest.approx(0.0)
+    assert _read(f"{prefix}{MIRROR_PV}") == pytest.approx(0.0)
+    # Contributed by base name, and prefixed by the server like any other.
+    _absent(f"{prefix}{prefix}{EXTRA_PV}")
+
+
+def test_stock_runner_contributes_nothing(serve) -> None:
+    """The base implementation adds no PVs, so the entries above are the hook's."""
+    prefix = serve("stock")
+
+    _read(f"{prefix}{IN_A}")
+    _absent(f"{prefix}{EXTRA_PV}")
+    _absent(f"{prefix}{MIRROR_PV}")
+
+
+def test_extend_pvdb_refuses_to_shadow_an_existing_name() -> None:
+    """Contributing a name the model or a control PV already owns is fatal.
+
+    Run in-process: the merge happens before any server is created, so nothing
+    binds a port before the failure.
+    """
+
+    class ShadowRunner(Runner):
+        def _extend_pvdb(self) -> dict[str, dict[str, Any]]:
+            return {IN_A: {"type": "float"}, RESET_CONTROL_PV: {"type": "int"}}
+
+    model = SeamModel(_MP.Event())
+    config = Runner.generate_config(model, prefix="SHADOW:")
+    config["protocol"] = ["ca"]
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ShadowRunner(model=model, config=config)
+
+    message = str(excinfo.value)
+    assert IN_A in message
+    assert RESET_CONTROL_PV in message
+
+
+# --------------------------------------------------------------------------
+# (d) ca_driver_cls: the replacement class is the one serving the database
+# --------------------------------------------------------------------------
+
+
+def test_ca_driver_cls_override_serves_the_database(serve) -> None:
+    """A write lands on a PV no model describes, transformed by the override.
+
+    The stock driver resolves a reason through ``pv_to_var`` and refuses
+    anything it cannot find, so both the acceptance and the value are the
+    override's doing.
+    """
+    prefix = serve("seam")
+
+    _put(f"{prefix}{EXTRA_PV}", 4.0)
+
+    assert _read(f"{prefix}{EXTRA_PV}") == pytest.approx(4.0 * EXTRA_GAIN)
+
+
+def test_stock_driver_refuses_an_extended_pv(serve) -> None:
+    """Without the override, the same write is refused by the stock driver."""
+    prefix = serve("extend_only")
+
+    epics.caput(f"{prefix}{EXTRA_PV}", 4.0, wait=True, timeout=OP_TIMEOUT)
+
+    assert _read(f"{prefix}{EXTRA_PV}") == pytest.approx(0.0)
+
+
+def test_ca_driver_cls_override_still_serves_the_model(serve) -> None:
+    """Delegating to the base class keeps the model's own PVs writable."""
+    prefix = serve("seam", echo_unconfirmed_writes=False)
+
+    _put(f"{prefix}{IN_A}", -2.5)
+
+    assert _read(f"{prefix}{IN_A}") == pytest.approx(-2.5)
+    assert _read(f"{prefix}{OUT_DOUBLE}") == pytest.approx(-5.0)
+
+
+# --------------------------------------------------------------------------
+# (e) _post_outputs: the run loop's publishing step is the overridable one
+# --------------------------------------------------------------------------
+
+
+def test_post_outputs_override_publishes_from_the_run_loop(serve) -> None:
+    prefix = serve("seam")
+
+    _put(f"{prefix}{IN_A}", 3.0)
+
+    assert _read(f"{prefix}{OUT_DOUBLE}") == pytest.approx(6.0)
+    assert _read(f"{prefix}{MIRROR_PV}") == pytest.approx(6.0 + MIRROR_OFFSET)
+
+
+def test_post_outputs_is_not_published_without_the_override(serve) -> None:
+    prefix = serve("extend_only")
+
+    _put(f"{prefix}{IN_A}", 3.0)
+
+    assert _read(f"{prefix}{OUT_DOUBLE}") == pytest.approx(6.0)
+    assert _read(f"{prefix}{MIRROR_PV}") == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------
+# (f) control_pvs: whether the runner claims a name of its own
+# --------------------------------------------------------------------------
+
+
+def test_control_pvs_are_served_by_default(serve) -> None:
+    """The default is what a runner setting nothing has always done."""
+    prefix = serve()
+
+    assert _read(f"{prefix}{RESET_CONTROL_PV}") == 0
+    with Context("pva") as ctx:
+        assert ctx.get(f"{prefix}{RESET_CONTROL_PV}", timeout=OP_TIMEOUT) is not None
+
+
+def test_control_pvs_false_claims_no_reset_pv(serve) -> None:
+    prefix = serve(control_pvs=False)
+
+    # The model's own PVs are served as before...
+    _read(f"{prefix}{IN_A}")
+    with Context("pva") as ctx:
+        assert ctx.get(f"{prefix}{IN_A}", timeout=OP_TIMEOUT) is not None
+
+        # ...and neither transport claims the control PV.
+        _absent(f"{prefix}{RESET_CONTROL_PV}")
+        with pytest.raises(PvaTimeoutError):
+            ctx.get(f"{prefix}{RESET_CONTROL_PV}", timeout=ABSENT_TIMEOUT)
+
+
+def test_control_pvs_false_leaves_the_write_path_working(serve) -> None:
+    """Suppressing the control PV must not disturb writes to the model."""
+    prefix = serve(control_pvs=False, echo_unconfirmed_writes=False)
+
+    _put(f"{prefix}{IN_A}", 1.5)
+
+    assert _read(f"{prefix}{IN_A}") == pytest.approx(1.5)
+    assert _read(f"{prefix}{OUT_DOUBLE}") == pytest.approx(3.0)

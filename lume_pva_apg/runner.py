@@ -93,6 +93,12 @@ class RunnerConfig(TypedDict):
         ``value_range`` before being handed to ``model.set()``. Default False,
         which passes the requested value through unchanged and leaves any
         range enforcement to the model.
+    control_pvs : bool
+        Whether the runner serves its own control PVs -- ``{prefix}RESET`` --
+        alongside the model's variables. Default True. Set it to False when the
+        runner shares its prefix with another server, or when the surrounding
+        deployment offers reset through a channel of its own, so the runner
+        claims no name the model did not ask for.
     """
 
     prefix: str
@@ -102,6 +108,7 @@ class RunnerConfig(TypedDict):
     echo_unconfirmed_writes: bool
     alarm_on_refused_write: bool
     clamp_writes: bool
+    control_pvs: bool
 
 
 class Runner:
@@ -239,6 +246,11 @@ class Runner:
             )
             return True
 
+    #: Driver class instantiated to serve the CA database. Override in a
+    #: subclass to serve reasons the stock driver knows nothing about; the
+    #: replacement is constructed with the runner as its only argument.
+    ca_driver_cls: type[pcaspy.Driver] = CaDriver
+
     def __init__(
         self,
         model: LUMEModel,
@@ -272,10 +284,11 @@ class Runner:
         self.var_to_pv = {}
         self.ca_pvs = {}
         # Base name of the reset control PV -- the key it holds in the pvdb, and
-        # the reason the CA driver is called back with.
+        # the reason the CA driver is called back with. Empty when control PVs
+        # are suppressed.
         self.reset_control_pv = ""
         self.ca_server: pcaspy.SimpleServer | None = None
-        self.ca_driver: Runner.CaDriver | None = None
+        self.ca_driver: pcaspy.Driver | None = None
 
         # Cache for previous state, value per name
         self._cached_state: dict[str, Any] = {}
@@ -362,7 +375,13 @@ class Runner:
             self._create_model_info()
 
         # Create additional control PVs
-        self._create_control_pvs()
+        if self.config.get("control_pvs", True):
+            self._create_control_pvs()
+
+        # Let a subclass add PVs of its own to the served CA database. Done
+        # before the server is created, since createPV takes the database whole.
+        if self.supports_ca:
+            self._merge_pvdb(self._extend_pvdb())
 
         # Start the server
         self.server = p4p.server.Server(providers=[self.providers])
@@ -371,7 +390,7 @@ class Runner:
         if len(self.pvdb.keys()) > 0:
             self.ca_server = pcaspy.SimpleServer()
             self.ca_server.createPV(self.config.get("prefix", ""), self.pvdb)
-            self.ca_driver = Runner.CaDriver(self)
+            self.ca_driver = self.ca_driver_cls(self)
 
             # Spin up a thread to run the pcaspy update loop
             self.ca_thread = threading.Thread(target=self._run_pcaspy, daemon=True)
@@ -637,6 +656,42 @@ class Runner:
         self.pvs[pv] = SharedPV(initial=val)
         self.providers[f"{self.config['prefix']}{pv}"] = self.pvs[pv]
 
+    def _extend_pvdb(self) -> dict[str, dict[str, Any]]:
+        """
+        Additional entries to serve alongside the model's own CA PVs.
+
+        Called once, before the CA server is created, and only when the CA
+        protocol is enabled. The base implementation contributes nothing; a
+        subclass returning entries here serves PVs the model does not describe,
+        and is expected to supply a :attr:`ca_driver_cls` that knows how to read
+        and write them -- the stock driver resolves a reason through the model's
+        variables and refuses anything it cannot find.
+
+        Returns
+        -------
+        dict[str, dict[str, Any]] :
+            pcaspy database entries, keyed by base PV name exactly as the pvdb
+            is: ``prefix`` is applied by the server, not here.
+        """
+        return {}
+
+    def _merge_pvdb(self, entries: dict[str, dict[str, Any]]) -> None:
+        """
+        Merge `entries` into the served database, refusing to shadow a PV.
+
+        A name already in the pvdb belongs to a model variable or to a control
+        PV, and silently replacing it would serve something other than what the
+        model describes under a name the model owns.
+        """
+        if not entries:
+            return
+
+        conflicts = sorted(set(entries) & set(self.pvdb))
+        if conflicts:
+            raise RuntimeError(f"Fatal name conflict: {', '.join(conflicts)} already exist!")
+
+        self.pvdb.update(entries)
+
     def _create_control_pvs(self):
         """Create any required control PVs"""
         # Create a reset PV, used to reset the model.
@@ -791,40 +846,7 @@ class Runner:
 
                 # Update output PVs with new values
                 pv_update_start = time.perf_counter()
-                LOG.debug(f"writing {len(out_values)} PVs")
-                for k, v in out_values.items():
-                    # The model may return None for an output; there is nothing
-                    # meaningful to post, and passing it downstream would either
-                    # silently substitute the variable default (PVA path) or raise
-                    # in value_to_native (CA path). Skip and warn instead.
-                    if v is None:
-                        LOG.warning(f"Model returned None for output '{k}'; skipping update")
-                        continue
-
-                    # Update PVA component
-                    pv = self.pvs.get(k)
-                    if pv is not None:
-                        try:
-                            pv.post(self._generate_value(k, v, latest_ts))
-                        except Exception as e:
-                            LOG.error(f"Error posting value for {k}: {e}")
-
-                    # Update CA component
-                    capv = self.ca_pvs.get(k)
-                    if capv is not None and self.ca_driver is not None:
-                        # pcaspy can only understand native python types, not necessarily what the model gives us.
-                        nv = self.pv_handlers[k].value_to_native(
-                            self.model.supported_variables[k], v
-                        )
-
-                        self.ca_driver.setParam(
-                            capv,
-                            nv,
-                            pcaspy.cas.epicsTimeStamp.fromPosixTimeStamp(latest_ts),
-                        )
-
-                if self.ca_driver is not None:
-                    self.ca_driver.updatePVs()
+                self._post_outputs(out_values, latest_ts)
 
                 LOG.debug(
                     f"PV update loop took {(time.perf_counter() - pv_update_start) * 1000.0:.3f} ms"
@@ -840,6 +862,56 @@ class Runner:
                         cb(sim_error)
                     except Exception as excp:
                         LOG.error(f"Error signalling put-completion: {excp}")
+
+    def _post_outputs(self, out_values: dict[str, Any], ts: float) -> None:
+        """
+        Publish a completed cycle's values to the PVs that carry them.
+
+        The output step of :meth:`_run`, factored out so that a subclass can
+        publish elsewhere, publish more, or publish nothing at all. Raising from
+        here fails the cycle exactly as raising inline did: the model is rolled
+        back to its cached state and every waiting put is completed with the
+        error.
+
+        Parameters
+        ----------
+        out_values : dict[str, Any]
+            Variable name -> value, as returned by ``model.get``.
+        ts : float
+            Timestamp to stamp the published values with.
+        """
+        LOG.debug(f"writing {len(out_values)} PVs")
+        for k, v in out_values.items():
+            # The model may return None for an output; there is nothing
+            # meaningful to post, and passing it downstream would either
+            # silently substitute the variable default (PVA path) or raise
+            # in value_to_native (CA path). Skip and warn instead.
+            if v is None:
+                LOG.warning(f"Model returned None for output '{k}'; skipping update")
+                continue
+
+            # Update PVA component
+            pv = self.pvs.get(k)
+            if pv is not None:
+                try:
+                    pv.post(self._generate_value(k, v, ts))
+                except Exception as e:
+                    LOG.error(f"Error posting value for {k}: {e}")
+
+            # Update CA component
+            capv = self.ca_pvs.get(k)
+            if capv is not None and self.ca_driver is not None:
+                # pcaspy can only understand native python types, not necessarily what the model gives us.
+                nv = self.pv_handlers[k].value_to_native(self.model.supported_variables[k], v)
+
+                self.ca_driver.setParam(
+                    capv,
+                    nv,
+                    pcaspy.cas.epicsTimeStamp.fromPosixTimeStamp(ts),
+                )
+
+        if self.ca_driver is not None:
+            self.ca_driver.updatePVs()
 
     def run(self):
         """

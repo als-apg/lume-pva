@@ -101,12 +101,63 @@ client's write is never merged into another's.
 
 ### Control PVs
 
-The runner always exposes a control PV:
+The runner exposes a control PV of its own:
 * `{prefix}RESET`: any write requests `model.reset()` and publishes the reset state to output PVs.
 
 The control PV is served over PVA, and is also available over CA when `protocol` includes `"ca"`.
 
+Set `control_pvs` to `False` and the runner serves the model's variables and
+nothing else. Use it when the runner shares its prefix with another server, or
+when the surrounding deployment offers reset through a channel of its own, so
+the runner claims no name the model did not ask for.
+
 `prefix` is passed to the constructor of the `Runner` class and defines a prefix to prepend to the start of PV names.
+
+### Extension Points
+
+A consumer that needs to serve more than the model describes can subclass
+`Runner` rather than fork it. Each seam below defaults to what the base class
+has always done.
+
+`_extend_pvdb()` returns additional pcaspy database entries. They are keyed by
+base PV name, exactly as the runner's own are — `prefix` is applied by the
+server, not by the caller. It is called once, after the model's variables and
+the control PVs are in the database and before the server is created, and only
+when `protocol` includes `"ca"`. Merging refuses to shadow a name already
+there, so a contributed PV can never silently replace one the model owns.
+
+`ca_driver_cls` is the driver class instantiated to serve that database,
+constructed with the runner as its only argument. The stock driver resolves a
+`reason` through the model's variables and refuses anything it cannot find, so
+a subclass contributing PVs of its own supplies a driver that knows how to
+write them and delegates the rest to `super()`. Reads need no override: the
+pcaspy default reads back through `getParam`.
+
+`_post_outputs(out_values, ts)` is the run loop's publishing step, given the
+values `model.get` returned and the timestamp to stamp them with. Overriding it
+lets a subclass publish elsewhere, publish more, or publish nothing. Raising
+from it fails the cycle exactly as raising inline did: the model is rolled back
+to its cached state and every waiting put completes with the error.
+
+```py
+class CoHostedRunner(Runner):
+    class Driver(Runner.CaDriver):
+        def write(self, reason, value):
+            if reason == "STATUS":
+                self.setParam(reason, value)
+                self.updatePV(reason)
+                return True
+            return super().write(reason, value)
+
+    ca_driver_cls = Driver
+
+    def _extend_pvdb(self):
+        return {"STATUS": {"type": "int", "value": 0}}
+
+    def _post_outputs(self, out_values, ts):
+        self.ca_driver.setParam("STATUS", len(out_values))
+        super()._post_outputs(out_values, ts)
+```
 
 ### Configuration
 
@@ -126,6 +177,7 @@ An example configuration:
     'echo_unconfirmed_writes': True, # Echo a written value before the model has accepted it
     'alarm_on_refused_write': False, # Alarm the CA PV when the model refuses a write
     'clamp_writes': False, # Clamp a written value into the variable's value_range
+    'control_pvs': True, # Serve the runner's own {prefix}RESET control PV
     'variables': {
         'input_a': {
             'name': 'input_a',
@@ -168,6 +220,10 @@ distribution retires once the upstream ones are merged and released.
 | Alarm a refused write (`alarm_on_refused_write`) | Channel Access put-completion ends an asynchronous write with `S_casApp_success` unconditionally; there is no failure channel. An alarm is the only way to tell a CA client its write did not land. |
 | Skip the batching window when `update_rate` is zero | The window was skipped only because its deadline had already elapsed by the time it was tested, making per-write isolation an accident of the clock rather than something the documented `update_rate` of zero guarantees. |
 | Clamp a write into the variable's `value_range` (`clamp_writes`) | `LUMEModel.set` does not enforce `value_range`, so an out-of-range write reaches the model unchallenged and, on failure, costs a whole simulation cycle. Applied at the point the write enters the server, so the echo matches what the model was given. |
+| Let a subclass contribute PVs to the served CA database (`_extend_pvdb`) | A consumer serving anything the model does not describe — a status channel, a second model's outputs — currently has to reach into `Runner.pvdb` between construction and the server being created, which is not a moment the constructor offers. A hook called before `createPV` gives it one, and refusing to shadow an existing name keeps the model's own PVs the model's. |
+| Make the CA driver class a class attribute (`ca_driver_cls`) | The driver was constructed as `Runner.CaDriver(self)`, naming the class literally, so serving a reason the stock driver does not know required replacing the constructor rather than the driver. |
+| Factor the run loop's output publishing into an overridable method (`_post_outputs`) | The publishing step was inline in `_run`, so a subclass that wanted to publish anything alongside the model's outputs had to reimplement the whole loop — batching window, cached-state rollback, put-completion signalling and all. |
+| Make the runner's control PVs optional (`control_pvs`) | `{prefix}RESET` is claimed unconditionally, which is a name collision waiting to happen for a runner sharing its prefix with another server, and dead weight where the deployment offers reset through a channel of its own. |
 | Publish `value_range` as CA display limits only, not as alarm thresholds | pcaspy compares `lolo`/`hihi` with `<=`/`>=`, so thresholds taken from the variable's own range put a value driven to either end of its legal span into MAJOR alarm — where the PVA path, which compares strictly, reports no alarm for the same value. This does not preserve the old behaviour for a value *outside* the range, which no longer alarms on CA at all; pcaspy's inclusive comparison cannot express a threshold that alarms outside the range without also alarming at it. |
 | Apply the PV name prefix exactly once on the Channel Access path | `prefix` was written into the pvdb keys and then applied again by `SimpleServer.createPV`, so a runner configured with `PFX:` served `PFX:PFX:name`. The driver names a PV by its pvdb key, so the same mistake left the cycle's output pass calling `setParam` with a name the database did not hold: every cycle raised `KeyError` and was logged as a failed simulation. Keying the database by base name leaves the prefix to the server, which is also what names a PV in every driver callback. Invisible at `prefix=""`, which is what every existing test used. |
 
