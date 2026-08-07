@@ -70,6 +70,20 @@ BLOCK_WINDOW = 0.5
 _MP = multiprocessing.get_context("spawn")
 
 
+def read_ca(pvname: str) -> float:
+    """Read ``pvname`` off the wire, never out of pyepics' monitor cache.
+
+    ``caget`` defaults to ``use_monitor=True``, which returns the value of the
+    last monitor callback this client happened to have processed. On a channel
+    an earlier read already subscribed to, that can be a *stale* value: a put
+    completes, and the read that follows still reports the previous value
+    because the monitor event has not been dispatched yet. The put is not at
+    fault and retrying hides it, so every value asserted on here is read
+    explicitly instead.
+    """
+    return float(epics.caget(pvname, timeout=OP_TIMEOUT, use_monitor=False))
+
+
 class GatedModel(LUMEModel):
     """
     A model whose simulation blocks until the test opens the gate.
@@ -287,7 +301,7 @@ def test_ca_put_waits_for_simulation(harness: RunnerHandle) -> None:
     )
 
     assert harness.completed.is_set()
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(14.0)
+    assert read_ca("sum_output") == pytest.approx(14.0)
 
 
 def test_standard_sim(harness: RunnerHandle):
@@ -296,31 +310,31 @@ def test_standard_sim(harness: RunnerHandle):
 
     # assert model set has completed
     assert harness.completed.is_set()
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(20.0)
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(10.0)
+    assert read_ca("sum_output") == pytest.approx(20.0)
+    assert read_ca("input_a") == pytest.approx(10.0)
 
 
 def test_failed_sim(harness: RunnerHandle):
     assert harness.completed.is_set()
     # Assert initial state
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(0.0)
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(0.0)
+    assert read_ca("input_a") == pytest.approx(0.0)
+    assert read_ca("sum_output") == pytest.approx(0.0)
 
     # Reasonable input
     epics.caput("input_a", 4.2, wait=True)
 
     # Verify record has processed
     assert harness.completed.is_set()
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(4.2)
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(8.4)
+    assert read_ca("input_a") == pytest.approx(4.2)
+    assert read_ca("sum_output") == pytest.approx(8.4)
 
     # attempt set out of bounds
     epics.caput("input_a", 7.0e6, wait=True)
 
     # reverting to previous (cached) value, runner is still operational
     assert harness.completed.is_set()
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(4.2)
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(8.4)
+    assert read_ca("input_a") == pytest.approx(4.2)
+    assert read_ca("sum_output") == pytest.approx(8.4)
 
 
 def test_pva_reset_calls_model_reset(harness: RunnerHandle) -> None:
