@@ -66,6 +66,146 @@ jobs:
         run: |
           uv run --project ${{ github.workspace }} --no-sync pytest --pyargs lume_pva_apg.tests
 
+  suite-without-torch:
+    # The suite spans a pure-Python core and four optional dependency sets, and
+    # its import guards are what let an install short of the full set still run
+    # the tests that need nothing it is missing. Every other leg installs
+    # everything, so a module-scope import of an optional dependency passes
+    # them all and then takes collection down -- the whole run, not one file --
+    # for any consumer who installed less.
+    #
+    # Deliberately an extra leg rather than a slimming of the matrix above:
+    # dropping torch there would stop exercising the Torch* cases rather than
+    # prove they are optional.
+    name: Suite runs without the torch extra
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # setuptools_scm derives the version from tags.
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies and package without the torch extra
+        run: |
+          uv sync --extra dev --no-editable
+      - name: No torch reached the environment
+        # This leg proves nothing if torch arrives anyway, and it could: a
+        # transitive dependency is free to require it. Checked rather than
+        # assumed, so the leg cannot quietly become a second full run.
+        run: |
+          installed=$(uv pip list --format=freeze)
+          echo "$installed"
+          if echo "$installed" | grep -iE '^(torch|lume-torch)='; then
+            echo "::error::torch is installed; this leg cannot test its absence"
+            exit 1
+          fi
+          echo "torch is absent"
+      - name: Run tests
+        # Run from outside the checkout, as the full legs do, so the tests
+        # import the installed distribution.
+        working-directory: ${{ runner.temp }}
+        run: |
+          uv run --project ${{ github.workspace }} --no-sync \
+            pytest --pyargs lume_pva_apg.tests --junitxml=report.xml
+      - name: Every test module ran
+        # Dying at collection fails the step above on its own. This catches the
+        # opposite regression: a guard widened until it skips whole modules
+        # leaves that step green with almost nothing in it. Asserting per
+        # module rather than on a total keeps the check from needing an update
+        # every time a test is added.
+        working-directory: ${{ runner.temp }}
+        run: |
+          uv run --project ${{ github.workspace }} --no-sync python - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          import lume_pva_apg.tests as tests
+
+          shipped = {p.stem for p in pathlib.Path(tests.__file__).parent.glob("test_*.py")}
+
+          root = ET.parse("report.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+
+          # Anything else a case may carry -- captured output, recorded
+          # properties -- says nothing about the outcome.
+          NOT_PASSED = {"skipped", "failure", "error"}
+
+          passed = set()
+          for case in suite.iter("testcase"):
+              origin = case.get("file") or case.get("classname", "").replace(".", "/")
+              if not any(child.tag in NOT_PASSED for child in case):
+                  passed.add(pathlib.Path(origin).stem)
+
+          print("shipped:", sorted(shipped))
+          print("contributed a passing test:", sorted(passed))
+
+          assert int(suite.get("errors", 0)) == 0, "a test module errored"
+          assert int(suite.get("failures", 0)) == 0, "a test failed"
+
+          silent = sorted(shipped - passed)
+          assert not silent, f"shipped but ran nothing without the torch extra: {silent}"
+          PY
+
+  sdist-round-trip:
+    # Every other leg installs from the checkout, where every file of the
+    # project is present whether or not the packaging ships it. A file left out
+    # of the sdist therefore passes the entire suite and fails on the first
+    # consumer to install the published artifact -- after the release that
+    # discovers it, and after the version number is spent. This leg installs
+    # what would actually be published and runs the suite out of that.
+    name: The sdist installs and passes its own tests
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build the sdist
+        run: |
+          uv build --sdist
+          ls -l dist/
+      - name: Install the sdist into an environment of its own
+        # Built from the tarball's own contents, into a venv outside the
+        # checkout, so nothing in the working tree can stand in for a file the
+        # sdist forgot. The extras come along: an extra that resolves from the
+        # checkout but not from the published metadata is the same class of
+        # bug and is just as unrecoverable once the version is published.
+        run: |
+          sdists=(dist/*.tar.gz)
+          if [ "${#sdists[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one sdist, found ${#sdists[@]}"
+            exit 1
+          fi
+          uv venv "$RUNNER_TEMP/sdist-venv"
+          uv pip install --python "$RUNNER_TEMP/sdist-venv" "${sdists[0]}[dev,torch]"
+      - name: The tests were shipped, and pass
+        # --pyargs resolves the package through the interpreter, so this can
+        # only find what the sdist installed. Collecting nothing exits 5 and
+        # fails the step, which is what a dropped tests package looks like.
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/sdist-venv/bin/python" -m pytest --pyargs lume_pva_apg.tests
+
   core-is-pure-python:
     # The core install must resolve from wheels alone on any platform: no
     # EPICS transport, no compiled extension, no native build. Consumers rely
