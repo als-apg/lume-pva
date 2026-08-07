@@ -4,13 +4,20 @@ These tests exercise the public handler interface (create_type, pack_value,
 unpack_value, default_value, value_to_native, native_to_value, is_supported,
 ca_pvspec) against in-memory p4p Value objects. No servers are started and no
 network or disk I/O is performed.
+
+The Torch* variable types live behind the 'torch' extra, and the cases for them
+are collected only when it is installed. Everything else here covers the
+variable types the core carries, so it runs on any install with the 'pva'
+extra.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import pytest
-import torch
 from lume.variables import (
     BoolVariable,
     EnumVariable,
@@ -20,19 +27,45 @@ from lume.variables import (
     StrVariable,
     Variable,
 )
-from lume_torch.variables import TorchNDVariable, TorchScalarVariable
-from p4p import Type
 
-from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
-from lume_pva_apg.variables import (
-    EnumVariableHandler,
-    NDVariableHandler,
-    ScalarVariableHandler,
-    SimpleScalarHandler,
-    TorchScalarVariableHandler,
-    VariableHandler,
-    find_variable_handler,
-)
+from lume_pva_apg.tests._requires import optional_module, skip_if_absent
+
+# The value layer is expressed in p4p types, so it needs the 'pva' extra even
+# where nothing is served. Guarded so a core-only install skips this file rather
+# than failing collection, which would take the whole suite with it.
+try:
+    from p4p import Type
+
+    from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
+    from lume_pva_apg.variables import (
+        EnumVariableHandler,
+        NDVariableHandler,
+        ScalarVariableHandler,
+        SimpleScalarHandler,
+        VariableHandler,
+        find_variable_handler,
+    )
+except ImportError as exc:
+    skip_if_absent(exc)
+
+torch = optional_module("torch", "torch")
+TORCH_INSTALLED = torch is not None and optional_module("lume_torch", "torch") is not None
+
+if TORCH_INSTALLED:
+    from lume_torch.variables import TorchNDVariable, TorchScalarVariable
+
+    from lume_pva_apg.variables import TorchScalarVariableHandler
+
+
+def _torch_cases(build: Callable[[], list]) -> list:
+    """The parametrisation cases that need the torch extra, or none without it.
+
+    Takes a callable rather than a list because a parametrisation evaluates its
+    cases at collection: a list built eagerly from ``torch`` objects would raise
+    while the module is being imported, which is the collection failure the
+    guard above exists to avoid.
+    """
+    return build() if TORCH_INSTALLED else []
 
 
 class DerivedScalarVariable(ScalarVariable):
@@ -56,13 +89,6 @@ class DerivedBoolVariable(BoolVariable):
         pytest.param(BoolVariable(name="b"), True, True, bool, id="bool-true"),
         pytest.param(BoolVariable(name="b"), False, False, bool, id="bool-false"),
         pytest.param(
-            TorchScalarVariable(name="x"),
-            torch.tensor(2.5),
-            2.5,
-            float,
-            id="torch_to_float",
-        ),
-        pytest.param(
             EnumVariable(name="e", options=["x", "y", "z"]),
             "x",
             "x",
@@ -75,6 +101,17 @@ class DerivedBoolVariable(BoolVariable):
             "z",
             str,
             id="enum_index",
+        ),
+        *_torch_cases(
+            lambda: [
+                pytest.param(
+                    TorchScalarVariable(name="x"),
+                    torch.tensor(2.5),
+                    2.5,
+                    float,
+                    id="torch_to_float",
+                ),
+            ]
         ),
     ],
 )
@@ -128,18 +165,20 @@ def test_numpy_array_roundtrip(
 
 @pytest.mark.parametrize(
     ("variable", "value", "expected"),
-    [
-        (
-            TorchNDVariable(name="tarr", shape=(2, 3), dtype=torch.float32),
-            torch.ones(2, 3, dtype=torch.float32),
-            torch.ones(2, 3, dtype=torch.float32),
-        ),
-        (
-            TorchNDVariable(name="tarr", shape=(2, 2, 3), dtype=torch.float32),
-            torch.arange(0, 1.2, 0.1, dtype=torch.float32).reshape(2, 2, 3),
-            torch.arange(0, 1.2, 0.1, dtype=torch.float32).reshape(2, 2, 3),
-        ),
-    ],
+    _torch_cases(
+        lambda: [
+            (
+                TorchNDVariable(name="tarr", shape=(2, 3), dtype=torch.float32),
+                torch.ones(2, 3, dtype=torch.float32),
+                torch.ones(2, 3, dtype=torch.float32),
+            ),
+            (
+                TorchNDVariable(name="tarr", shape=(2, 2, 3), dtype=torch.float32),
+                torch.arange(0, 1.2, 0.1, dtype=torch.float32).reshape(2, 2, 3),
+                torch.arange(0, 1.2, 0.1, dtype=torch.float32).reshape(2, 2, 3),
+            ),
+        ]
+    ),
 )
 def test_torch_array_roundtrip(
     variable: NDVariable,
@@ -166,8 +205,8 @@ def test_torch_array_roundtrip(
         pytest.param(BoolVariable(name="b"), id="bool"),
         pytest.param(StrVariable(name="s"), id="str"),
         pytest.param(NDVariable(name="nd", shape=(2, 2), dtype=np.int16), id="nd"),
-        pytest.param(TorchScalarVariable(name="ts"), id="torchscalar"),
         pytest.param(EnumVariable(name="enum", options=["A", "B", "C"]), id="enum"),
+        *_torch_cases(lambda: [pytest.param(TorchScalarVariable(name="ts"), id="torchscalar")]),
     ],
 )
 def test_valid_p4p_type(variable: Variable) -> None:
@@ -226,13 +265,17 @@ def test_control_limits_and_units_metadata(
     [
         (NDVariable(name="n", shape=(2, 3)), np.zeros((2, 3)), [2, 3]),
         (NDVariable(name="n", shape=(2, 2, 3)), np.zeros((2, 2, 3)), [2, 2, 3]),
-        (TorchNDVariable(name="n", shape=(2, 3)), torch.zeros((2, 3)), [2, 3]),
-        (
-            TorchNDVariable(name="n", shape=(2,)),
-            torch.zeros((2,)),
-            [
-                2,
-            ],
+        *_torch_cases(
+            lambda: [
+                (TorchNDVariable(name="n", shape=(2, 3)), torch.zeros((2, 3)), [2, 3]),
+                (
+                    TorchNDVariable(name="n", shape=(2,)),
+                    torch.zeros((2,)),
+                    [
+                        2,
+                    ],
+                ),
+            ]
         ),
     ],
 )
@@ -259,9 +302,13 @@ def test_dimension_size_metadata(variable, value, size):
         (BoolVariable(name="bool", default_value=True), True),
         (EnumVariable(name="enum", options=["A", "B", "C"], default_value="B"), "B"),
         (EnumVariable(name="enum", options=["A", "B", "C"]), "A"),
-        (TorchScalarVariable(name="torchscalar", default_value=1.0), 1.0),
-        (TorchScalarVariable(name="torchscalar"), 0),
         # (NDVariable(name="nd", shape=(2, 3), dtype=np.int64), np.array(((1,2,3), (4,5,6))) ),
+        *_torch_cases(
+            lambda: [
+                (TorchScalarVariable(name="torchscalar", default_value=1.0), 1.0),
+                (TorchScalarVariable(name="torchscalar"), 0),
+            ]
+        ),
     ],
 )
 def test_default_value_passthrough(
@@ -300,22 +347,26 @@ def test_default_value_passthrough(
         # string arrays fail to roundtrip
         # (NDVariable(name="nd", shape=(2,), dtype=np.dtypes.StringDType(),),
         #  np.array(["", ""], dtype=np.dtypes.StringDType())),
-        (
-            TorchNDVariable(
-                name="ndtorch",
-                shape=(2, 3),
-                dtype=torch.int64,
-                default_value=torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
-            ),
-            torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
-        ),
-        (
-            TorchNDVariable(
-                name="ndtorch",
-                shape=(5, 5),
-                dtype=torch.int64,
-            ),
-            torch.zeros(5, 5),
+        *_torch_cases(
+            lambda: [
+                (
+                    TorchNDVariable(
+                        name="ndtorch",
+                        shape=(2, 3),
+                        dtype=torch.int64,
+                        default_value=torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
+                    ),
+                    torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
+                ),
+                (
+                    TorchNDVariable(
+                        name="ndtorch",
+                        shape=(5, 5),
+                        dtype=torch.int64,
+                    ),
+                    torch.zeros(5, 5),
+                ),
+            ]
         ),
     ],
 )
@@ -345,8 +396,14 @@ def test_default_array_value_passthrough(
             "B",
             id="enum",
         ),
-        pytest.param(
-            TorchScalarVariable(name="torchscalar", default_value=1.0), 1.0, id="torchscalar"
+        *_torch_cases(
+            lambda: [
+                pytest.param(
+                    TorchScalarVariable(name="torchscalar", default_value=1.0),
+                    1.0,
+                    id="torchscalar",
+                ),
+            ]
         ),
     ],
 )
@@ -373,15 +430,19 @@ def test_default_value_method_scalar_like(
             np.array(((1, 2, 3), (4, 5, 6))),
             id="nd",
         ),
-        pytest.param(
-            TorchNDVariable(
-                name="ndtorch",
-                shape=(2, 3),
-                dtype=torch.int64,
-                default_value=torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
-            ),
-            torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
-            id="torchnd",
+        *_torch_cases(
+            lambda: [
+                pytest.param(
+                    TorchNDVariable(
+                        name="ndtorch",
+                        shape=(2, 3),
+                        dtype=torch.int64,
+                        default_value=torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
+                    ),
+                    torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
+                    id="torchnd",
+                ),
+            ]
         ),
     ],
 )
@@ -408,7 +469,6 @@ def test_default_value_method_array_like(
             EnumVariable(name="enum", options=["A", "B", "C"], default_value="B"),
             id="enum",
         ),
-        pytest.param(TorchScalarVariable(name="torchscalar", default_value=1.0), id="torchscalar"),
         pytest.param(
             NDVariable(
                 name="nd",
@@ -418,14 +478,22 @@ def test_default_value_method_array_like(
             ),
             id="nd",
         ),
-        pytest.param(
-            TorchNDVariable(
-                name="ndtorch",
-                shape=(2, 3),
-                dtype=torch.int64,
-                default_value=torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
-            ),
-            id="torchnd",
+        *_torch_cases(
+            lambda: [
+                pytest.param(
+                    TorchScalarVariable(name="torchscalar", default_value=1.0),
+                    id="torchscalar",
+                ),
+                pytest.param(
+                    TorchNDVariable(
+                        name="ndtorch",
+                        shape=(2, 3),
+                        dtype=torch.int64,
+                        default_value=torch.tensor(np.array(((1, 2, 3), (4, 5, 6)))),
+                    ),
+                    id="torchnd",
+                ),
+            ]
         ),
     ],
 )
@@ -440,7 +508,7 @@ def test_pack_value_none_matches_default_value(variable: Variable) -> None:
 
     if isinstance(expected, np.ndarray):
         np.testing.assert_array_equal(unpacked, expected)
-    elif isinstance(expected, torch.Tensor):
+    elif TORCH_INSTALLED and isinstance(expected, torch.Tensor):
         torch.testing.assert_close(unpacked, expected)
     else:
         assert unpacked == expected
@@ -453,9 +521,13 @@ def test_pack_value_none_matches_default_value(variable: Variable) -> None:
             ScalarVariable(name="x", value_range=(0.0, 10.0), default_value=5.0),
             id="scalarvar",
         ),
-        pytest.param(
-            TorchScalarVariable(name="x", value_range=(0.0, 10.0), default_value=5.0),
-            id="torchscalarvar",
+        *_torch_cases(
+            lambda: [
+                pytest.param(
+                    TorchScalarVariable(name="x", value_range=(0.0, 10.0), default_value=5.0),
+                    id="torchscalarvar",
+                ),
+            ]
         ),
     ],
 )
@@ -547,12 +619,6 @@ def test_value_to_native(
             id="non_numeric_value",
         ),
         pytest.param(
-            TorchScalarVariable(name="x"),
-            "not-a-torch-number",
-            TypeError,
-            id="non_torch_numeric_value",
-        ),
-        pytest.param(
             ScalarVariable(
                 name="strict",
                 value_range=(0.0, 10.0),
@@ -598,6 +664,16 @@ def test_value_to_native(
             TypeError,
             id="not_array",
         ),
+        *_torch_cases(
+            lambda: [
+                pytest.param(
+                    TorchScalarVariable(name="x"),
+                    "not-a-torch-number",
+                    TypeError,
+                    id="non_torch_numeric_value",
+                ),
+            ]
+        ),
     ],
 )
 def test_raise_packing_invalid_value(
@@ -632,11 +708,28 @@ def test_raise_packing_invalid_value(
             },
             id="scalar_no_extras",
         ),
-        pytest.param(TorchScalarVariable(name="x"), {}, id="tscalar_no_extras"),
+        # A range and a unit that are neither absent nor symmetric, so a spec
+        # that dropped them, zeroed them, or swapped the two limits differs
+        # from a spec that carried them through.
         pytest.param(
-            TorchNDVariable(name="x", shape=(2, 3)),
-            {"count": 6, "type": "float"},
-            id="tnd",
+            ScalarVariable(name="x", value_range=(-2.5, 7.5), unit="mm"),
+            {
+                "unit": "mm",
+                "type": "float",
+                "lolim": -2.5,
+                "hilim": 7.5,
+            },
+            id="scalar_with_range_and_unit",
+        ),
+        pytest.param(
+            IntVariable(name="i", value_range=(-3, 9), unit="counts"),
+            {
+                "unit": "counts",
+                "type": "int",
+                "lolim": -3,
+                "hilim": 9,
+            },
+            id="int_with_range_and_unit",
         ),
         pytest.param(
             NDVariable(name="x", shape=(2, 3)),
@@ -651,6 +744,16 @@ def test_raise_packing_invalid_value(
             },
             id="enum_mbbi",
         ),
+        *_torch_cases(
+            lambda: [
+                pytest.param(TorchScalarVariable(name="x"), {}, id="tscalar_no_extras"),
+                pytest.param(
+                    TorchNDVariable(name="x", shape=(2, 3)),
+                    {"count": 6, "type": "float"},
+                    id="tnd",
+                ),
+            ]
+        ),
     ],
 )
 def test_ca_pvspec(
@@ -661,6 +764,32 @@ def test_ca_pvspec(
     assert handler is not None
 
     assert handler.ca_pvspec(variable) == expected_spec
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        pytest.param(ScalarVariable(name="x", value_range=(-2.5, 7.5)), id="scalar"),
+        pytest.param(IntVariable(name="i", value_range=(-3, 9)), id="int"),
+    ],
+)
+def test_ca_pvspec_publishes_no_alarm_thresholds(variable: Variable) -> None:
+    """A range is a display limit on CA and nothing else.
+
+    pcaspy evaluates a numeric alarm only where a lolo/hihi pair is present and
+    lolo < hihi, and it compares them inclusively, so a threshold taken from the
+    variable's own range alarms on a value driven to either end of its legal
+    span. Omitting the keys is what disables the check -- a pair of zeros is
+    still a defined threshold -- so the assertion is on their absence, not on
+    their value.
+    """
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    spec = handler.ca_pvspec(variable)
+
+    assert {"lolo", "hihi", "low", "high"}.isdisjoint(spec)
+    assert (spec["lolim"], spec["hilim"]) == variable.value_range
 
 
 @pytest.mark.parametrize(
@@ -694,11 +823,15 @@ def test_handler_report_dtype_support(dtype: type[np.generic], expected: bool) -
         (ScalarVariable, ScalarVariableHandler),
         (IntVariable, ScalarVariableHandler),
         (NDVariable, NDVariableHandler),
-        (TorchScalarVariable, TorchScalarVariableHandler),
-        (TorchNDVariable, NDVariableHandler),
         (BoolVariable, SimpleScalarHandler),
         (StrVariable, SimpleScalarHandler),
         (EnumVariable, EnumVariableHandler),
+        *_torch_cases(
+            lambda: [
+                (TorchScalarVariable, TorchScalarVariableHandler),
+                (TorchNDVariable, NDVariableHandler),
+            ]
+        ),
     ],
 )
 def test_should_return_matching_handler_for_each_variable_type(

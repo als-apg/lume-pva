@@ -1,15 +1,30 @@
-"""Tests for lume_pva_apg.runner configuration generation.
+"""Tests for lume_pva_apg.runner configuration.
 
-Runner.__init__ starts PVA/CA servers, so these tests only exercise the pure
-configuration logic (Runner.generate_config) using a stub model object — no
-servers are started and no network calls are made.
+Two things are covered: the configuration ``Runner.generate_config`` produces,
+and what the constructor rejects when it is handed one by hand -- which is the
+supported way to use it, since the generated configuration is documented as
+something to edit before passing on.
+
+Both run in-process against a stub model. ``Runner.__init__`` validates the
+whole ``variables`` table before it creates either server, so a configuration
+the constructor rejects binds no port; nothing here starts a server or makes a
+network call.
 """
 
 import numpy as np
 import pytest
-from lume.variables import NDVariable, ScalarVariable, Variable
 
-from lume_pva_apg.runner import Runner
+from lume_pva_apg.tests._requires import skip_if_absent
+
+# No server is started here, but importing the runner still needs both
+# transports. Guarded so an install missing one of them skips this file rather
+# than failing collection, which would take the whole suite with it.
+try:
+    from lume.variables import NDVariable, ScalarVariable, Variable
+
+    from lume_pva_apg.runner import Runner
+except ImportError as exc:
+    skip_if_absent(exc)
 
 
 class StubModel:
@@ -68,6 +83,66 @@ def test_no_variables() -> None:
     config = Runner.generate_config(empty_model)
 
     assert config["variables"] == {}
+
+
+def test_a_variable_the_model_does_not_have_is_rejected(model: StubModel) -> None:
+    """A configuration is edited by hand, so a name in it can be a typo.
+
+    Accepted, it serves a PV backed by nothing: reads answer with the type's
+    default and writes are silently discarded.
+    """
+    config = Runner.generate_config(model)
+    config["variables"]["input_a"]["name"] = "input_typo"
+
+    with pytest.raises(KeyError, match="input_typo"):
+        Runner(model=model, config=config)
+
+
+def test_an_unknown_pv_mode_is_rejected(model: StubModel) -> None:
+    """Anything but 'rw' or 'ro'. Not defaulted: 'r', 'readonly' and 'w' all
+    read as an intent to restrict, and defaulting them to the variable's own
+    permission serves a writable PV to someone who asked for a read-only one."""
+    config = Runner.generate_config(model)
+    config["variables"]["input_a"]["mode"] = "readonly"
+
+    with pytest.raises(KeyError, match="readonly"):
+        Runner(model=model, config=config)
+
+
+def test_a_writable_pv_for_a_read_only_variable_is_rejected(model: StubModel) -> None:
+    """``mode`` is the configuration's claim and ``read_only`` is the model's.
+
+    The model wins, and loudly: a PV served writable over a variable the model
+    refuses to set accepts writes from a client and drops every one of them.
+    """
+    config = Runner.generate_config(model)
+    assert config["variables"]["output_b"]["mode"] == "ro"
+    config["variables"]["output_b"]["mode"] = "rw"
+
+    with pytest.raises(ValueError, match="output_b"):
+        Runner(model=model, config=config)
+
+
+def test_a_variable_type_with_no_handler_is_rejected() -> None:
+    """A type no handler claims cannot be put on the wire at all.
+
+    Distinct from a *supported* type carrying an unservable dtype, which is
+    logged and skipped: that leaves the rest of the model served, while a type
+    the handler table does not know about means the caller is holding a
+    variable this package cannot represent.
+    """
+
+    class UnhandledVariable(Variable):
+        def validate_value(self, *args, **kwargs) -> None:
+            # Abstract on Variable, and never reached: the runner rejects the
+            # type before a value is ever offered to it.
+            raise NotImplementedError
+
+    model = StubModel({"odd": UnhandledVariable(name="odd")})
+    config = Runner.generate_config(model)
+
+    with pytest.raises(RuntimeError, match="UnhandledVariable"):
+        Runner(model=model, config=config)
 
 
 def _make_runner_control_stub(protocol: list[str]) -> Runner:

@@ -37,6 +37,8 @@ import pytest
 from lume.exceptions import ReadOnlyError
 from lume.variables.variable import ConfigEnum, Variable
 
+from lume_pva_apg.tests._requires import skip_if_absent
+
 # Keep all EPICS traffic on the loopback interface. Must be set before p4p,
 # pyepics, or the pcaspy server (created in Runner.__init__) initialise.
 os.environ.setdefault("EPICS_CA_ADDR_LIST", "127.0.0.1")
@@ -44,12 +46,18 @@ os.environ.setdefault("EPICS_CA_AUTO_ADDR_LIST", "NO")
 os.environ.setdefault("EPICS_PVA_ADDR_LIST", "127.0.0.1")
 os.environ.setdefault("EPICS_PVA_AUTO_ADDR_LIST", "NO")
 
-import epics
-from lume.model import LUMEModel
-from lume.variables import ScalarVariable
-from p4p.client.thread import Context
+# Both transports serve here and the CA client is pyepics, so this module needs
+# the whole dev set. Guarded so an install missing one of them skips this file
+# rather than failing collection, which would take the whole suite with it.
+try:
+    import epics
+    from lume.model import LUMEModel
+    from lume.variables import ScalarVariable
+    from p4p.client.thread import Context
 
-from lume_pva_apg.runner import Runner
+    from lume_pva_apg.runner import Runner
+except ImportError as exc:
+    skip_if_absent(exc)
 
 # Generous upper bound for any single operation to complete.
 OP_TIMEOUT = 10.0
