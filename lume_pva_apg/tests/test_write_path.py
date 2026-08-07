@@ -77,10 +77,9 @@ _MP = multiprocessing.get_context("spawn")
 _TAGS = itertools.count()
 
 # The variables PolicyModel serves, before its per-server tag is appended. The
-# Runner's own `prefix` would be the natural way to separate one test's PVs
-# from another's, but it is applied twice on the CA path -- once into the pvdb
-# keys and again by SimpleServer.createPV -- so a prefixed runner serves names
-# its own driver cannot resolve. Tagging the variables sidesteps that entirely.
+# Runner's own `prefix` would separate one test's PVs from another's just as
+# well; tagging the variables instead keeps the write-path assertions here
+# independent of how a prefix reaches the wire, which has a suite of its own.
 INPUT_A = "input_a"
 INPUT_B = "input_b"
 INPUT_I = "input_i"

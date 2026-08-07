@@ -168,6 +168,7 @@ distribution retires once the upstream ones are merged and released.
 | Alarm a refused write (`alarm_on_refused_write`) | Channel Access put-completion ends an asynchronous write with `S_casApp_success` unconditionally; there is no failure channel. An alarm is the only way to tell a CA client its write did not land. |
 | Skip the batching window when `update_rate` is zero | The window was skipped only because its deadline had already elapsed by the time it was tested, making per-write isolation an accident of the clock rather than something the documented `update_rate` of zero guarantees. |
 | Clamp a write into the variable's `value_range` (`clamp_writes`) | `LUMEModel.set` does not enforce `value_range`, so an out-of-range write reaches the model unchallenged and, on failure, costs a whole simulation cycle. Applied at the point the write enters the server, so the echo matches what the model was given. |
+| Apply the PV name prefix exactly once on the Channel Access path | `prefix` was written into the pvdb keys and then applied again by `SimpleServer.createPV`, so a runner configured with `PFX:` served `PFX:PFX:name`. The driver names a PV by its pvdb key, so the same mistake left the cycle's output pass calling `setParam` with a name the database did not hold: every cycle raised `KeyError` and was logged as a failed simulation. Keying the database by base name leaves the prefix to the server, which is also what names a PV in every driver callback. Invisible at `prefix=""`, which is what every existing test used. |
 
 ### Fork-local changes
 

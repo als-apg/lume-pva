@@ -37,6 +37,9 @@ VALID_PV_MODES = ["rw", "ro"]
 
 DEFAULT_PV_MODE = "rw"
 
+# Base name of the reset control PV, served as f"{prefix}{RESET_CONTROL_PV}".
+RESET_CONTROL_PV = "RESET"
+
 
 class RunnerVariable(TypedDict):
     """
@@ -268,6 +271,8 @@ class Runner:
         self.pv_to_var: dict[str, str] = {}  # Map pv name -> variable name
         self.var_to_pv = {}
         self.ca_pvs = {}
+        # Base name of the reset control PV -- the key it holds in the pvdb, and
+        # the reason the CA driver is called back with.
         self.reset_control_pv = ""
         self.ca_server: pcaspy.SimpleServer | None = None
         self.ca_driver: Runner.CaDriver | None = None
@@ -532,7 +537,9 @@ class Runner:
         ro : bool
             True if read-only
         prefix : str
-            String to prefix the PV name with
+            String to prefix the PV name with. Applies to the PVA provider name
+            only: pcaspy prefixes the CA names itself, in ``createPV``, from the
+            base names the pvdb is keyed by.
         handler : VariableHandler
             The variable handler for this variable type
         """
@@ -556,8 +563,11 @@ class Runner:
             LOG.debug(f"Creating CA PV: pv={pv}")
             spec = handler.ca_pvspec(var)
 
-            self.pvdb[f"{prefix}{pv}"] = spec
-            self.pvdb[f"{prefix}{pv}"].update({"asyn": True})
+            # Keyed by the base name: SimpleServer.createPV prepends the prefix
+            # to build the served name, and every callback into the driver --
+            # write's `reason`, setParam, updatePV -- names the PV by this key.
+            self.pvdb[pv] = spec
+            self.pvdb[pv].update({"asyn": True})
             # enable async for put-completion
             self.ca_pvs[var.name] = pv
 
@@ -630,8 +640,13 @@ class Runner:
     def _create_control_pvs(self):
         """Create any required control PVs"""
         # Create a reset PV, used to reset the model.
-        reset_pvname = f"{self.config['prefix']}RESET"
-        self.reset_control_pv = reset_pvname
+        #
+        # The CA database is keyed by base name -- pcaspy prepends the prefix
+        # itself, and names the PV by its base name in every driver callback --
+        # while a PVA provider is registered under the full name.
+        reset_reason = RESET_CONTROL_PV
+        reset_pvname = f"{self.config['prefix']}{reset_reason}"
+        self.reset_control_pv = reset_reason
 
         # Create a PVA shared PV for reset if PVA is enabled
         if self.supports_pva:
@@ -652,12 +667,12 @@ class Runner:
 
         # Create the CA reset PV if CA is enabled
         if self.supports_ca:
-            if reset_pvname in self.pvdb:
+            if reset_reason in self.pvdb:
                 raise RuntimeError(
-                    f"Fatal name conflict: {reset_pvname} for the CA reset PV already exists!"
+                    f"Fatal name conflict: {reset_reason} for the CA reset PV already exists!"
                 )
 
-            self.pvdb[reset_pvname] = {
+            self.pvdb[reset_reason] = {
                 "type": "int",
                 "value": 0,
                 "asyn": False,
