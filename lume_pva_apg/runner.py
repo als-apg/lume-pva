@@ -4,7 +4,7 @@ import numbers
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from queue import Empty, Queue
 from typing import Any, TypedDict
 
@@ -453,6 +453,8 @@ class Runner:
         values: dict[str, Any],
         done: Callable[[str | None], None] | None = None,
         reset: bool = False,
+        *,
+        jobs: Iterable[Callable[[], None]] = (),
     ) -> None:
         """
         Enqueue a batch of PV updates to be applied to the model.
@@ -468,12 +470,19 @@ class Runner:
             put-completion to clients until results are actually available.
         reset : bool
             When true, request model.reset() before applying this batch.
+        jobs : Iterable[Callable[[], None]]
+            Keyword-only. Callables the run loop invokes on its own thread, in
+            the order given. A job owns its operation end to end, including its
+            own error handling: the loop passes it no arguments and reads
+            nothing back from it. Collected into a list when the batch is
+            enqueued, so a one-shot iterable is safe to pass. Empty by default.
         """
         self.queue.put(
             {
                 "values": values,
                 "done": [done] if done is not None else [],
                 "reset": reset,
+                "jobs": list(jobs),
             }
         )
 
@@ -656,6 +665,29 @@ class Runner:
         self.pvs[pv] = SharedPV(initial=val)
         self.providers[f"{self.config['prefix']}{pv}"] = self.pvs[pv]
 
+    def _cycle_output_names(self) -> list[str]:
+        """
+        Names of the variables read back from the model after each cycle.
+
+        Called on every model pass, after ``model.set``; :meth:`_post_outputs`
+        receives exactly these variables' values. The base implementation reads
+        the model's whole roster, which is what the stock output step publishes.
+        A subclass that publishes only part of the model, or publishes it
+        elsewhere, narrows the read here so a cycle does not compute values
+        nothing will use. An empty list skips the read entirely, and
+        :meth:`_post_outputs` is handed an empty dict.
+
+        Only the post-cycle read is narrowed. The snapshot of the settable state
+        that a failed cycle rolls back to is still taken in full.
+
+        Returns
+        -------
+        list[str] :
+            Variable names to pass to ``model.get``, each a key of
+            ``model.supported_variables``.
+        """
+        return list(self.model.supported_variables)
+
     def _extend_pvdb(self) -> dict[str, dict[str, Any]]:
         """
         Additional entries to serve alongside the model's own CA PVs.
@@ -770,31 +802,67 @@ class Runner:
         """
         while True:
             # Wait for new data to come in
-            item = self.queue.get()
+            self._run_cycle(self.queue.get())
 
-            value_data: dict = item["values"]
-            done_callbacks: list = item["done"]
-            reset_requested: bool = item.get("reset", False)
+    def _run_cycle(self, item: dict) -> None:
+        """
+        Run one cycle of the run loop for a dequeued item.
 
-            # Wait for a time window of 'update_rate' seconds to pass before
-            # continuing, batching whatever else arrives into the same cycle.
-            #
-            # An update_rate of zero skips the window entirely: this item is the
-            # whole batch, so each queued write gets a model.set() of its own and
-            # can never be merged with another client's. Writes that arrived
-            # while the previous cycle ran stay queued and are served in order,
-            # one cycle each.
-            if self.update_rate > 0:
-                until = time.monotonic() + self.update_rate
-                while time.monotonic() < until:
-                    try:
-                        next_update = self.queue.get_nowait()
-                        value_data.update(next_update["values"])
-                        done_callbacks.extend(next_update["done"])
-                        reset_requested = reset_requested or next_update.get("reset", False)
-                    except Empty:
-                        pass
+        A cycle has two parts. First, every job in the batch runs, in arrival
+        order. Then the model pass runs: snapshot the settable state, reset if
+        requested, ``model.set`` the batch's values, read back the variables
+        :meth:`_cycle_output_names` lists and publish them. The pass runs only when the batch has something for the
+        model -- values, a reset, or no jobs at all (the empty start-up item
+        publishes the initial outputs). A batch of jobs alone touches the model
+        only through its jobs.
 
+        A job owns its operation and its reply, so a job that raises anyway is
+        logged and passed over. That does not fail the cycle: the remaining
+        jobs and the pass still run. Only a failed pass rolls the model back to
+        the cached state and hands its error to the batch's completion
+        callbacks, which receive ``None`` otherwise, including when the pass was
+        skipped.
+
+        Parameters
+        ----------
+        item : dict
+            A queue item as built by :meth:`_enqueue`. Items drained during the
+            batching window are merged into it in place.
+        """
+        value_data: dict = item["values"]
+        done_callbacks: list = item["done"]
+        reset_requested: bool = item.get("reset", False)
+        jobs: list = item.get("jobs", [])
+
+        # Wait for a time window of 'update_rate' seconds to pass before
+        # continuing, batching whatever else arrives into the same cycle.
+        #
+        # An update_rate of zero skips the window entirely: this item is the
+        # whole batch, so each queued write gets a model.set() of its own and
+        # can never be merged with another client's. Writes that arrived
+        # while the previous cycle ran stay queued and are served in order,
+        # one cycle each.
+        if self.update_rate > 0:
+            until = time.monotonic() + self.update_rate
+            while time.monotonic() < until:
+                try:
+                    next_update = self.queue.get_nowait()
+                    value_data.update(next_update["values"])
+                    done_callbacks.extend(next_update["done"])
+                    reset_requested = reset_requested or next_update.get("reset", False)
+                    jobs.extend(next_update.get("jobs", []))
+                except Empty:
+                    pass
+
+        for job in jobs:
+            try:
+                job()
+            except Exception as exc:
+                LOG.exception(f"Run-loop job failed: ({exc}); continuing the cycle")
+
+        run_pass = bool(value_data) or reset_requested or not jobs
+
+        if run_pass:
             new_values = {}
             latest_ts = 0.0
             for k, g in value_data.items():
@@ -823,9 +891,10 @@ class Runner:
             ]
             self._set_cached_state(self.model.get(settable_var_names))
 
-            # Set and simulate
-            sim_error = None
-            try:
+        # Set and simulate
+        sim_error = None
+        try:
+            if run_pass:
                 if reset_requested:
                     reset_start = time.perf_counter()
                     LOG.info("Reset requested through RESET control PV")
@@ -840,9 +909,14 @@ class Runner:
                 LOG.debug(f"Model set() took {(time.perf_counter() - set_start) * 1000.0:.3f} ms")
 
                 # Get new simulated values
-                get_start = time.perf_counter()
-                out_values = self.model.get(self.model.supported_variables)
-                LOG.debug(f"Model get() took {(time.perf_counter() - get_start) * 1000.0:.3f} ms")
+                output_names = self._cycle_output_names()
+                out_values = {}
+                if output_names:
+                    get_start = time.perf_counter()
+                    out_values = self.model.get(output_names)
+                    LOG.debug(
+                        f"Model get() took {(time.perf_counter() - get_start) * 1000.0:.3f} ms"
+                    )
 
                 # Update output PVs with new values
                 pv_update_start = time.perf_counter()
@@ -851,17 +925,17 @@ class Runner:
                 LOG.debug(
                     f"PV update loop took {(time.perf_counter() - pv_update_start) * 1000.0:.3f} ms"
                 )
-            except Exception as exc:
-                sim_error = str(exc)
-                LOG.error(f"Simulation Cycle Failed: ({sim_error}), resetting to cached value")
-                self._reset_to_cached_state()
-            finally:
-                # With simulation compoleted, signal put completion to any waitihng clients
-                for cb in done_callbacks:
-                    try:
-                        cb(sim_error)
-                    except Exception as excp:
-                        LOG.error(f"Error signalling put-completion: {excp}")
+        except Exception as exc:
+            sim_error = str(exc)
+            LOG.error(f"Simulation Cycle Failed: ({sim_error}), resetting to cached value")
+            self._reset_to_cached_state()
+        finally:
+            # With simulation completed, signal put completion to any waiting clients
+            for cb in done_callbacks:
+                try:
+                    cb(sim_error)
+                except Exception as excp:
+                    LOG.error(f"Error signalling put-completion: {excp}")
 
     def _post_outputs(self, out_values: dict[str, Any], ts: float) -> None:
         """
