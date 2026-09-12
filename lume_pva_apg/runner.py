@@ -649,14 +649,20 @@ class Runner:
         for e in envs:
             val["env"][e] = os.environ.get(e, "")
 
+        # The info describes what is served. A model variable the
+        # configuration omits has no channel on either transport, so it has
+        # no place here either.
         vars = []
         for k, v in self.model.supported_variables.items():
+            spec = self.config["variables"].get(k)
+            if spec is None:
+                continue
             info = {
                 "name": v.name,
                 "read_only": v.read_only,
-                "pvname": self.config["variables"][k]["pv"],
+                "pvname": spec["pv"],
                 "type": v.__class__.__name__,
-                "mode": self.config["variables"][k]["mode"],
+                "mode": spec["mode"],
             }
             vars.append(info)
 

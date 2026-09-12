@@ -774,3 +774,33 @@ def test_run_hands_each_queue_item_to_run_cycle_in_order() -> None:
 
     assert seen[0] is first
     assert seen[1] is second
+
+
+# --------------------------------------------------------------------------
+# model info lists only the variables the configuration serves
+# --------------------------------------------------------------------------
+
+
+def _make_model_info_stub(model: StubModel, served: dict) -> Runner:
+    runner = Runner.__new__(Runner)
+    runner.model = model
+    runner._config = {"prefix": "", "description": "stub", "variables": served}
+    runner.types = {}
+    runner.pvs = {}
+    runner.providers = {}
+    return runner
+
+
+def test_model_info_lists_only_configured_variables(model: StubModel) -> None:
+    """A model variable the configuration omits is served on no transport, and
+    the model info PV describes what is served: it leaves that variable out
+    instead of failing on its missing entry."""
+    served = {"input_a": {"pv": "input_a", "mode": "rw"}}
+    runner = _make_model_info_stub(model, served)
+
+    runner._create_model_info()
+
+    info = runner.pvs["model_info"].current()
+    listed = [(v["name"], v["pvname"], v["mode"]) for v in info["supported_variables"]]
+    assert listed == [("input_a", "input_a", "rw")]
+    assert "model_info" in runner.providers
