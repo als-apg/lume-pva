@@ -160,7 +160,7 @@ class Runner:
 
             # Update PVs in simulator
             self.runner._enqueue(
-                {self.variable.name: {"value": value, "ts": time.monotonic()}},
+                {self.variable.name: {"value": value, "ts": time.time()}},
                 done=_complete,
             )
             if self.runner.echo_unconfirmed_writes:
@@ -247,7 +247,7 @@ class Runner:
                 self.callbackPV(reason)
 
             self.runner._enqueue(
-                {vn: {"value": nv, "ts": time.monotonic()}},
+                {vn: {"value": nv, "ts": time.time()}},
                 done=_complete_put,
             )
             return True
@@ -802,7 +802,7 @@ class Runner:
         Helper to update timestamp on a value
         """
         if ts is None:
-            ts = time.monotonic()
+            ts = time.time()
         value["timeStamp"]["nanoseconds"] = math.fmod(ts, 1.0) * 1e9
         value["timeStamp"]["secondsPastEpoch"] = int(ts)
 
@@ -899,7 +899,7 @@ class Runner:
 
             # Use current time if we're missing a latest timestamp
             if latest_ts <= 0:
-                latest_ts = time.monotonic()
+                latest_ts = time.time()
 
             # Stash previous state
             settable_var_names = [

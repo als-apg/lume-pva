@@ -14,6 +14,7 @@ network call.
 from queue import Queue
 from types import SimpleNamespace
 
+import time
 import numpy as np
 import pytest
 
@@ -804,3 +805,17 @@ def test_model_info_lists_only_configured_variables(model: StubModel) -> None:
     listed = [(v["name"], v["pvname"], v["mode"]) for v in info["supported_variables"]]
     assert listed == [("input_a", "input_a", "rw")]
     assert "MODEL_INFO" in runner.providers
+
+
+def test_published_values_carry_wall_clock_timestamps(model: StubModel) -> None:
+    """A served value is stamped with UNIX time, never the monotonic clock.
+
+    ``_generate_value`` without an explicit ``ts`` is the path every
+    subclass-published value takes. Stamping it from the monotonic clock
+    puts every timestamp a client sees in January 1970."""
+    runner = _make_model_info_stub(model, {})
+    before = time.time()
+    value = runner._generate_value("a", 1.0)
+    after = time.time()
+    stamped = value["timeStamp"]["secondsPastEpoch"] + value["timeStamp"]["nanoseconds"] / 1e9
+    assert before - 1.0 <= stamped <= after + 1.0
