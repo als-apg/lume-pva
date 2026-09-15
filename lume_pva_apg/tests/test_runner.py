@@ -800,7 +800,7 @@ def test_model_info_lists_only_configured_variables(model: StubModel) -> None:
 
     runner._create_model_info()
 
-    info = runner.pvs["model_info"].current()
+    info = runner.pvs["MODEL_INFO"].current()
     listed = [(v["name"], v["pvname"], v["mode"]) for v in info["supported_variables"]]
     assert listed == [("input_a", "input_a", "rw")]
-    assert "model_info" in runner.providers
+    assert "MODEL_INFO" in runner.providers
