@@ -273,8 +273,9 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable]):
                 v["alarm"]["status"] = int(epicsAlarmStatus.NO_STATUS)
 
     def create_type(self, variable: ScalarVariable | IntVariable) -> Type:
+        # IntVariable subclasses ScalarVariable, so it has to be tested first.
         return NTScalar.buildType(
-            "d" if isinstance(variable, ScalarVariable) else "l",
+            "i" if isinstance(variable, IntVariable) else "d",
             control=True,
             display=True,
         )
@@ -294,7 +295,7 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable]):
 
         variable.validate_value(value)
 
-        v = Value(type_, {"value": float(value)})
+        v = Value(type_, {"value": value if isinstance(variable, IntVariable) else float(value)})
         self.set_metadata(variable, v, value)
         return v
 

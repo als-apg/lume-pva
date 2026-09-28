@@ -34,7 +34,8 @@ from lume_pva_apg.tests._requires import optional_module, skip_if_absent
 # where nothing is served. Guarded so a core-only install skips this file rather
 # than failing collection, which would take the whole suite with it.
 try:
-    from p4p import Type
+    from p4p import Type, Value
+    from p4p.nt import NTScalar
 
     from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
     from lume_pva_apg.variables import (
@@ -212,6 +213,67 @@ def test_torch_array_roundtrip(
 def test_valid_p4p_type(variable: Variable) -> None:
     handler = find_variable_handler(type(variable))
     assert isinstance(handler.create_type(variable), Type)
+
+
+@pytest.mark.parametrize(
+    ("variable", "code"),
+    [
+        pytest.param(IntVariable(name="i"), "i", id="int"),
+        pytest.param(ScalarVariable(name="x"), "d", id="float"),
+    ],
+)
+def test_scalar_type_wire_code(variable: Variable, code: str) -> None:
+    """An int variable is served as an int32 NTScalar, not as a double.
+
+    IntVariable subclasses ScalarVariable, so a handler that tests for the base
+    class first serves every integer variable as a double.
+    """
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    type_ = handler.create_type(variable)
+
+    assert type_["value"] == code
+    assert type_.aspy() == NTScalar.buildType(code, control=True, display=True).aspy()
+    assert "display" in type_.keys()
+    assert "control" in type_.keys()
+
+
+def test_int_variable_pack_unpack_keeps_int() -> None:
+    variable = IntVariable(name="i", value_range=(-3, 9), unit="counts")
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    type_ = handler.create_type(variable)
+
+    packed = handler.pack_value(variable, type_, 7)
+
+    assert packed["value"] == 7
+    assert isinstance(packed["value"], int)
+    assert packed.display.limitLow == -3
+    assert packed.display.limitHigh == 9
+    assert packed.control.limitLow == -3
+    assert packed.control.limitHigh == 9
+    assert packed.display.units == "counts"
+    assert packed.alarm.severity == int(epicsAlarmSeverity.NO_ALARM)
+
+    unpacked = handler.unpack_value(variable, packed)
+
+    assert unpacked == 7
+    assert type(unpacked) is int
+    variable.validate_value(unpacked)
+
+
+def test_int_variable_unpacks_client_put() -> None:
+    """A value a PVA client writes to an int PV unpacks to an accepted int."""
+    variable = IntVariable(name="i", value_range=(-4, 4))
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    put = Value(handler.create_type(variable), {"value": -2})
+
+    unpacked = handler.unpack_value(variable, put)
+
+    assert unpacked == -2
+    assert type(unpacked) is int
+    variable.validate_value(unpacked)
 
 
 # timestamp?  display/controls metadata mismatched?
