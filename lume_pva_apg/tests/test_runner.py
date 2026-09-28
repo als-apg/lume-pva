@@ -11,10 +11,10 @@ the constructor rejects binds no port; nothing here starts a server or makes a
 network call.
 """
 
+import time
 from queue import Queue
 from types import SimpleNamespace
 
-import time
 import numpy as np
 import pytest
 
