@@ -191,10 +191,36 @@ class SeamRunner(ExtendOnlyRunner):
         super()._post_outputs(out_values, ts)
 
 
+# The variable PvaOnlyVariableRunner keeps off CA.
+PVA_ONLY = OUT_DOUBLE
+
+
+class PvaOnlyVariableRunner(Runner):
+    """Serves one variable over PVA only, by clearing ``supports_ca`` around it.
+
+    A consumer that must leave one name to another CA server keeps that name
+    off its own CA database this way, without giving up CA for the rest. The
+    flag is restored in a ``finally``, so everything read after ``_add_pv`` --
+    the other variables, the pvdb merge, the control PVs -- still sees CA on.
+    """
+
+    def _add_pv(self, pv: str, var: Any, ro: bool, prefix: str, handler: Any) -> None:
+        if var.name != PVA_ONLY:
+            super()._add_pv(pv, var, ro, prefix, handler)
+            return
+        supports_ca = self.supports_ca
+        self.supports_ca = False
+        try:
+            super()._add_pv(pv, var, ro, prefix, handler)
+        finally:
+            self.supports_ca = supports_ca
+
+
 _RUNNERS: dict[str, type[Runner]] = {
     "stock": Runner,
     "extend_only": ExtendOnlyRunner,
     "seam": SeamRunner,
+    "pva_only_variable": PvaOnlyVariableRunner,
     # The stock runner, serving a MixedModel instead of a SeamModel.
     "mixed": Runner,
     # The stock runner, serving a MixedModel with output_severity / extra-key knobs.
@@ -807,3 +833,26 @@ def test_severity_a_pva_put_to_a_udf_name_keeps_invalid_udf(serve) -> None:
     raw = _pva_raw(prefix, MIXED_INT)
     assert raw["value"] == 7
     assert (raw["alarm"]["severity"], raw["alarm"]["status"]) == PVA_UDF
+
+
+# --------------------------------------------------------------------------
+# supports_ca cleared around _add_pv keeps one variable off CA
+# --------------------------------------------------------------------------
+
+
+def test_supports_ca_cleared_serves_pva_only(serve) -> None:
+    """The variable added with ``supports_ca`` cleared is PVA-only; the rest keep CA."""
+    prefix = serve("pva_only_variable")
+
+    with Context("pva") as ctx:
+        assert ctx.get(f"{prefix}{PVA_ONLY}", timeout=OP_TIMEOUT) is not None
+        assert ctx.get(f"{prefix}{IN_A}", timeout=OP_TIMEOUT) is not None
+
+    _absent(f"{prefix}{PVA_ONLY}")
+    assert _read(f"{prefix}{IN_A}") == pytest.approx(0.0)
+    assert _read(f"{prefix}{RESET_CONTROL_PV}") == 0
+
+    # The output pass skips the name CA does not serve and still publishes it
+    # over PVA.
+    _put(f"{prefix}{IN_A}", 1.5)
+    assert _pva_raw(prefix, PVA_ONLY)["value"] == pytest.approx(3.0)
