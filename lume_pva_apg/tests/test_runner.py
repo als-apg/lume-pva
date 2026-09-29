@@ -35,8 +35,23 @@ try:
         StrVariable,
         Variable,
     )
+    from p4p.server.thread import SharedPV
 
-    from lume_pva_apg.runner import Runner, _resolve_pv_meta
+    from lume_pva_apg.runner import _CONDITIONS, Runner, _resolve_pv_meta
+    from lume_pva_apg.tests._mixed_model import (
+        FAIL_MALFORMED,
+        FAIL_RAISE,
+        FAIL_UDF,
+        MIXED_BOOL,
+        MIXED_ENUM,
+        MIXED_EXTRA_KEY,
+        MIXED_FLOAT_IN,
+        MIXED_FLOAT_OUT,
+        MIXED_INT,
+        MIXED_SEVERITY_TRIGGER,
+        MIXED_STR,
+        MixedModel,
+    )
     from lume_pva_apg.variables import (
         TORCH_AVAILABLE,
         TorchNDVariable,
@@ -1159,3 +1174,655 @@ def test_add_pv_puts_a_configured_precision_in_the_ca_pvspec(
     runner._add_pv("X_PV", var, ro=False, prefix="", handler=runner.pv_handlers["x"])
 
     assert runner.pvdb["X_PV"].get("prec") == expected
+
+
+# --------------------------------------------------------------------------
+# undefined (UDF) alarm overlay
+# --------------------------------------------------------------------------
+
+
+def _alarm(value) -> tuple[int, int]:
+    return value["alarm"]["severity"], value["alarm"]["status"]
+
+
+def _udf_pv_stub(var: Variable) -> tuple[Runner, SharedPV]:
+    """A server-free runner serving ``var`` as ``x`` on a real SharedPV, built
+    the way ``_add_pv`` builds it."""
+    runner = _meta_stub(var)
+    pv = SharedPV(
+        handler=Runner.Handler(variable=var, runner=runner, read_only=var.read_only),
+        initial=runner._generate_value("x", None),
+    )
+    return runner, pv
+
+
+def test_the_runner_class_default_udf_is_an_empty_frozenset() -> None:
+    runner = Runner.__new__(Runner)
+    assert runner._udf == frozenset()
+    assert isinstance(runner._udf, frozenset)
+
+
+def test_a_udf_name_posted_via_generate_value_carries_invalid_udf() -> None:
+    runner, pv = _udf_pv_stub(ScalarVariable(name="x", value_range=(0.0, 10.0), read_only=True))
+    runner._udf = frozenset({"x"})
+
+    pv.post(runner._generate_value("x", 2.5))
+
+    assert _alarm(pv.current()) == (3, 6)
+    assert pv.current()["value"] == 2.5
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        pytest.param(2.5, (0, 0), id="in-range"),
+        pytest.param(20.0, (2, 2), id="out-of-range"),
+    ],
+)
+def test_a_name_not_in_udf_carries_the_handler_alarm_pair(value: float, expected: tuple) -> None:
+    runner, pv = _udf_pv_stub(ScalarVariable(name="x", value_range=(0.0, 10.0), read_only=True))
+    runner._udf = frozenset({"other"})
+
+    pv.post(runner._generate_value("x", value))
+
+    assert _alarm(pv.current()) == expected
+
+
+def test_pack_value_never_applies_the_udf_overlay() -> None:
+    runner = _meta_stub(ScalarVariable(name="x", value_range=(0.0, 10.0)))
+    runner._udf = frozenset({"x"})
+    ts = 1_700_000_000.25
+
+    packed = runner._pack_value("x", 2.5, ts)
+    generated = runner._generate_value("x", 2.5, ts)
+
+    assert _alarm(packed) == (0, 0)
+    assert _alarm(generated) == (3, 6)
+    assert generated["value"] == packed["value"]
+
+
+def test_the_add_pv_initial_value_with_an_empty_udf_is_unchanged_from_0_1_4() -> None:
+    """With nothing undefined, the initial value is exactly what the handler
+    packs -- the 0.1.4 value -- apart from the wall-clock timestamp."""
+    var = ScalarVariable(name="x", value_range=(0.0, 10.0))
+    runner = _meta_stub(var)
+    runner._udf = frozenset()
+    runner.supports_pva = True
+    runner.supports_ca = False
+
+    runner._add_pv("x", var, False, "", runner.pv_handlers["x"])
+
+    initial = runner.pvs["x"].current()
+    packed = runner._pack_value("x", None)
+    strip = lambda d: {k: v for k, v in d.items() if k != "timeStamp"}  # noqa: E731
+    assert strip(initial.todict()) == strip(packed.todict())
+    assert _alarm(initial) == _alarm(packed)
+
+
+def test_a_put_carrying_alarm_fields_leaves_a_standing_udf_alarm() -> None:
+    """The client's alarm leaves are unmarked before either echo, so a put
+    cannot overwrite the stored (INVALID, UDF) pair."""
+    var = ScalarVariable(name="x", value_range=(-10.0, 10.0))
+    runner, pv = _udf_pv_stub(var)
+    runner._udf = frozenset({"x"})
+    pv.post(runner._generate_value("x", 1.0))
+    runner.echo_unconfirmed_writes = True
+    runner.clamp_writes = False
+    runner._enqueue = lambda values, done=None, **kw: done(None)
+
+    put = runner.types["x"](
+        {"value": 4.2, "alarm": {"severity": 0, "status": 0, "message": "client"}}
+    )
+    put.mark("value")
+    put.mark("alarm.severity")
+    put.mark("alarm.status")
+    put.mark("alarm.message")
+    finished = []
+    op = SimpleNamespace(value=lambda: put, done=lambda error=None: finished.append(error))
+
+    Runner.Handler(variable=var, runner=runner, read_only=False).put(pv, op)
+
+    stored = pv.current()
+    assert finished == [None]
+    assert stored["value"] == 4.2
+    assert _alarm(stored) == (3, 6)
+    assert stored["alarm"]["message"] != "client"
+
+
+# --------------------------------------------------------------------------
+# output_severity hook evaluation
+# --------------------------------------------------------------------------
+
+
+def _severity_runner(**model_attrs) -> Runner:
+    """A server-free runner whose model carries only ``model_attrs``."""
+    runner = Runner.__new__(Runner)
+    runner.model = SimpleNamespace(**model_attrs)
+    return runner
+
+
+def test_severity_conditions_table_maps_udf_to_the_pva_and_ca_pairs() -> None:
+    import pcaspy
+
+    assert set(_CONDITIONS) == {"udf"}
+    pva, ca = _CONDITIONS["udf"]
+    assert pva == (3, 6)
+    assert ca == (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM)
+
+
+def test_severity_without_a_hook_is_an_empty_frozenset() -> None:
+    runner = _severity_runner()
+    assert runner._evaluate_severity(["a", "b"]) == frozenset()
+
+
+def test_severity_with_a_non_callable_hook_attribute_is_an_empty_frozenset() -> None:
+    runner = _severity_runner(output_severity={"a": {"condition": "udf"}})
+    assert runner._evaluate_severity(["a"]) == frozenset()
+
+
+def test_severity_valid_reply_returns_the_udf_names_and_calls_the_hook_once() -> None:
+    calls = []
+
+    def hook(names):
+        calls.append(list(names))
+        return {"a": {"condition": "udf"}, "c": {"condition": "udf"}}
+
+    runner = _severity_runner(output_severity=hook)
+    result = runner._evaluate_severity(["a", "b", "c"])
+
+    assert result == frozenset({"a", "c"})
+    assert isinstance(result, frozenset)
+    assert calls == [["a", "b", "c"]]
+
+
+def test_severity_empty_reply_returns_an_empty_frozenset() -> None:
+    runner = _severity_runner(output_severity=lambda names: {})
+    assert runner._evaluate_severity(["a"]) == frozenset()
+
+
+def test_severity_reply_keys_outside_the_requested_names_are_ignored() -> None:
+    # Keys outside ``names`` are ignored whatever their value, even malformed.
+    runner = _severity_runner(
+        output_severity=lambda names: {
+            "a": {"condition": "udf"},
+            "other": {"condition": "udf"},
+            "junk": {"condition": "nonsense"},
+            "worse": 42,
+        }
+    )
+    assert runner._evaluate_severity(["a", "b"]) == frozenset({"a"})
+
+
+def test_severity_unknown_condition_raises_naming_condition_and_variable() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"b": {"condition": "stale"}})
+    with pytest.raises(ValueError) as info:
+        runner._evaluate_severity(["a", "b"])
+    assert "stale" in str(info.value)
+    assert "b" in str(info.value)
+
+
+def test_severity_unhashable_condition_raises_value_error() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"b": {"condition": ["udf"]}})
+    with pytest.raises(ValueError, match="b"):
+        runner._evaluate_severity(["b"])
+
+
+def test_severity_entry_without_a_condition_raises_naming_the_variable() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"speed": {}})
+    with pytest.raises(ValueError, match="speed"):
+        runner._evaluate_severity(["speed"])
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(["a"], id="list"),
+        pytest.param("udf", id="str"),
+        pytest.param({"a"}, id="set"),
+    ],
+)
+def test_severity_non_dict_reply_raises(reply) -> None:
+    runner = _severity_runner(output_severity=lambda names: reply)
+    with pytest.raises(ValueError):
+        runner._evaluate_severity(["a"])
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param("udf", id="str"),
+        pytest.param(None, id="none"),
+        pytest.param(["udf"], id="list"),
+    ],
+)
+def test_severity_non_dict_entry_raises_naming_the_variable(entry) -> None:
+    runner = _severity_runner(output_severity=lambda names: {"speed": entry})
+    with pytest.raises(ValueError, match="speed"):
+        runner._evaluate_severity(["speed"])
+
+
+def test_severity_exception_from_the_hook_propagates_unchanged() -> None:
+    class HookFailure(RuntimeError):
+        pass
+
+    def hook(names):
+        raise HookFailure("model cannot tell")
+
+    runner = _severity_runner(output_severity=hook)
+    with pytest.raises(HookFailure, match="model cannot tell"):
+        runner._evaluate_severity(["a"])
+
+
+def test_severity_evaluation_does_not_touch_the_runner_udf_state() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"a": {"condition": "udf"}})
+    runner._udf = frozenset({"z"})
+    runner._evaluate_severity(["a"])
+    assert runner._udf == frozenset({"z"})
+
+
+# --------------------------------------------------------------------------
+# _post_outputs: two-phase publishing under an output_severity hook
+# --------------------------------------------------------------------------
+
+POST_TS = 1_700_000_000.5
+
+
+class _PvSpy:
+    """A real SharedPV that also logs every post into a shared event list."""
+
+    def __init__(self, name: str, initial, events: list, *, fail: bool = False) -> None:
+        self.name = name
+        self.events = events
+        self.fail = fail
+        self.shared = SharedPV(initial=initial)
+
+    def post(self, value) -> None:
+        if self.fail:
+            raise RuntimeError(f"post of {self.name} refused")
+        self.events.append(("post", self.name, _alarm(value), value.changedSet()))
+        self.shared.post(value)
+
+    def current(self):
+        return self.shared.current()
+
+
+class _CaSpy:
+    """Records the pcaspy driver calls ``_post_outputs`` makes, in order."""
+
+    def __init__(self, events: list, *, fail_set: tuple = (), fail_update: bool = False) -> None:
+        self.events = events
+        self.fail_set = fail_set
+        self.fail_update = fail_update
+
+    def setParam(self, reason, value, timestamp=None) -> None:
+        if reason in self.fail_set:
+            raise RuntimeError(f"setParam of {reason} refused")
+        self.events.append(("setParam", reason, value))
+
+    def setParamStatus(self, reason, alarm, severity) -> None:
+        self.events.append(("setParamStatus", reason, alarm, severity))
+
+    def updatePVs(self) -> None:
+        if self.fail_update:
+            raise RuntimeError("updatePVs refused")
+        self.events.append(("updatePVs",))
+
+
+def _ca(name: str) -> str:
+    return f"CA_{name}"
+
+
+def _post_runner(model: MixedModel, events: list, **ca_kwargs) -> Runner:
+    """A server-free runner serving every MixedModel variable on a spied PVA
+    SharedPV and a recording CA driver, requesting the whole roster."""
+    runner = Runner.__new__(Runner)
+    runner.model = model
+    runner.pv_handlers = {}
+    runner.types = {}
+    for name, var in model.supported_variables.items():
+        handler = find_variable_handler(type(var))
+        runner.pv_handlers[name] = handler
+        runner.types[name] = handler.create_type(var)
+    runner.pvs = {
+        name: _PvSpy(name, runner._generate_value(name, None), events)
+        for name in model.supported_variables
+    }
+    runner.ca_pvs = {name: _ca(name) for name in model.supported_variables}
+    runner.ca_driver = _CaSpy(events, **ca_kwargs)
+    runner._udf = frozenset()
+    runner._cycle_requested_names = tuple(model.supported_variables)
+    hook = getattr(model, "output_severity", None)
+    if hook is not None:
+
+        def logged(names):
+            events.append(("hook", list(names)))
+            return hook(names)
+
+        model.output_severity = logged
+    return runner
+
+
+def _trigger(model: MixedModel) -> dict:
+    """Drive the model to the severity trigger; return a whole-roster get."""
+    model.set({MIXED_FLOAT_IN: MIXED_SEVERITY_TRIGGER})
+    return model.get(list(model.supported_variables))
+
+
+def _posts(events: list) -> dict:
+    return {e[1]: e[2] for e in events if e[0] == "post"}
+
+
+def _set_params(events: list) -> list:
+    return [e[1] for e in events if e[0] == "setParam"]
+
+
+def _ca_calls(events: list) -> list:
+    return [e for e in events if e[0] in ("setParam", "setParamStatus", "updatePVs")]
+
+
+def test_post_outputs_requested_names_class_default_is_empty() -> None:
+    assert Runner.__new__(Runner)._cycle_requested_names == ()
+
+
+def test_post_outputs_sees_the_names_run_cycle_requested() -> None:
+    events: list = []
+    seen: list = []
+    runner = _wide_cycle_runner(events, runner_cls=_NarrowRunner)
+    runner._post_outputs = lambda out_values, ts: seen.append(runner._cycle_requested_names)
+
+    runner._run_cycle(_item({IN_X: _write(1.0, 4.0)}))
+
+    assert seen == [(IN_X, OUT_Z)]
+
+
+def test_post_outputs_without_a_hook_posts_as_0_1_4() -> None:
+    """No hook: every Value is ``_generate_value``'s (no forced alarm pair), one
+    setParam per name, one updatePVs, no setParamStatus, and ``_udf`` stays empty."""
+    events: list = []
+    model = MixedModel()
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+    expected = {name: runner._generate_value(name, value, POST_TS) for name, value in out.items()}
+
+    runner._post_outputs(out, POST_TS)
+
+    posts = [e for e in events if e[0] == "post"]
+    assert [p[1] for p in posts] == list(out)
+    for _, name, pair, changed in posts:
+        assert pair == _alarm(expected[name])
+        assert changed == expected[name].changedSet()
+    # the range rule still holds for the out-of-range float output
+    assert _posts(events)[MIXED_FLOAT_OUT] == (2, 2)
+    assert _ca_calls(events)[-1] == ("updatePVs",)
+    assert _set_params(events) == [_ca(n) for n in out]
+    assert not [e for e in events if e[0] == "setParamStatus"]
+    assert runner._udf == frozenset()
+
+
+def test_post_outputs_without_a_hook_ignores_an_extra_key_as_0_1_4() -> None:
+    """A hook-less model whose ``_get`` adds an unserved, wrongly typed key
+    publishes exactly what the same model without the key publishes."""
+    plain_events: list = []
+    extra_events: list = []
+    plain = MixedModel()
+    extra = MixedModel(extra_key=True)
+    plain_runner = _post_runner(plain, plain_events)
+    extra_runner = _post_runner(extra, extra_events)
+    extra_out = _trigger(extra)
+    assert MIXED_EXTRA_KEY in extra_out
+
+    plain_runner._post_outputs(_trigger(plain), POST_TS)
+    extra_runner._post_outputs(extra_out, POST_TS)
+
+    assert extra_events == plain_events
+    assert extra_runner._udf == frozenset()
+
+
+def test_post_outputs_calls_the_hook_once_with_the_cycle_names_before_posting() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+
+    runner._post_outputs(out, POST_TS)
+
+    hooks = [e for e in events if e[0] == "hook"]
+    assert hooks == [("hook", list(model.supported_variables))]
+    assert events[0][0] == "hook"
+
+
+def test_post_outputs_udf_names_carry_invalid_udf_on_both_transports() -> None:
+    import pcaspy
+
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert posts[MIXED_FLOAT_OUT] == (3, 6)
+    assert posts[MIXED_INT] == (3, 6)
+    assert runner.pvs[MIXED_INT].current()["alarm"]["status"] == 6
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+    udf_ca = (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM)
+    ca = _ca_calls(events)
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        # the status directly follows that name's setParam
+        set_at = [c[:2] for c in ca].index(("setParam", _ca(name)))
+        assert ca[set_at + 1] == ("setParamStatus", _ca(name), *udf_ca)
+    assert [c for c in ca if c[0] == "setParamStatus"] == [
+        ("setParamStatus", _ca(MIXED_FLOAT_OUT), *udf_ca),
+        ("setParamStatus", _ca(MIXED_INT), *udf_ca),
+    ]
+    assert ca[-1] == ("updatePVs",)
+    assert ca.count(("updatePVs",)) == 1
+
+
+def test_post_outputs_names_absent_from_the_reply_keep_the_range_rule_or_no_alarm() -> None:
+    """With a hook every post carries an explicit pair: the handler's range
+    rule where it marked one, (0, 0) where it marked none."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF, udf_names=(MIXED_INT,))
+    runner = _post_runner(model, events)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert posts[MIXED_INT] == (3, 6)
+    assert posts[MIXED_FLOAT_OUT] == (2, 2)  # -15.0, outside value_range
+    assert posts[MIXED_FLOAT_IN] == (0, 0)  # inside value_range
+    for name in (MIXED_BOOL, MIXED_STR, MIXED_ENUM):
+        assert posts[name] == (0, 0)
+    changed = {e[1]: e[3] for e in events if e[0] == "post"}
+    for name in model.supported_variables:
+        assert {"alarm.severity", "alarm.status"} <= changed[name], name
+
+
+def test_post_outputs_recovered_udf_names_leave_invalid() -> None:
+    """The explicit pair on the next post clears a stored (3, 6); ``_udf``
+    empties; CA recovers through setParam with no setParamStatus."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    runner._post_outputs(_trigger(model), POST_TS)
+    assert _alarm(runner.pvs[MIXED_INT].current()) == (3, 6)
+
+    events.clear()
+    model.set({MIXED_FLOAT_IN: 2.0})
+    runner._post_outputs(model.get(list(model.supported_variables)), POST_TS + 1)
+
+    assert _alarm(runner.pvs[MIXED_INT].current()) == (0, 0)
+    assert _alarm(runner.pvs[MIXED_FLOAT_OUT].current()) == (0, 0)
+    assert runner._udf == frozenset()
+    assert not [e for e in events if e[0] == "setParamStatus"]
+
+
+def test_post_outputs_a_name_the_cycle_did_not_read_keeps_its_udf_state() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    runner._udf = frozenset({MIXED_STR, MIXED_INT})
+    runner._cycle_requested_names = (MIXED_FLOAT_IN, MIXED_INT)
+    model.set({MIXED_FLOAT_IN: 2.0})
+
+    runner._post_outputs(model.get([MIXED_FLOAT_IN, MIXED_INT]), POST_TS)
+
+    # MIXED_INT was read and reported clean; MIXED_STR was not read at all.
+    assert runner._udf == frozenset({MIXED_STR})
+    assert set(_posts(events)) == {MIXED_FLOAT_IN, MIXED_INT}
+
+
+def test_post_outputs_an_extra_key_never_reaches_the_hook_udf_or_phase_1() -> None:
+    """An unserved extra key and a served but unrequested one, both wrongly
+    typed: neither is shown to the hook, posted, converted or put in ``_udf``."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF, extra_key=True)
+    runner = _post_runner(model, events)
+    requested = [n for n in model.supported_variables if n != MIXED_BOOL]
+    runner._cycle_requested_names = tuple(requested)
+    model.set({MIXED_FLOAT_IN: MIXED_SEVERITY_TRIGGER})
+    out = model.get(requested)
+    assert MIXED_EXTRA_KEY in out
+    out[MIXED_BOOL] = object()
+
+    runner._post_outputs(out, POST_TS)
+
+    assert [e for e in events if e[0] == "hook"] == [("hook", requested)]
+    assert set(_posts(events)) == set(requested)
+    assert _ca(MIXED_BOOL) not in _set_params(events)
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+
+@pytest.mark.parametrize(
+    "fail_mode, error",
+    [
+        pytest.param(FAIL_RAISE, RuntimeError, id="hook-raises"),
+        pytest.param(FAIL_MALFORMED, ValueError, id="unknown-condition"),
+    ],
+)
+def test_post_outputs_a_failing_severity_hook_posts_nothing(fail_mode: str, error: type) -> None:
+    events: list = []
+    model = MixedModel(fail_mode=fail_mode)
+    runner = _post_runner(model, events)
+    runner._udf = frozenset({MIXED_STR})
+
+    with pytest.raises(error):
+        runner._post_outputs(_trigger(model), POST_TS)
+
+    assert [e[0] for e in events] == ["hook"]
+    assert runner._udf == frozenset({MIXED_STR})
+
+
+def test_post_outputs_a_ca_conversion_error_in_phase_1_posts_nothing() -> None:
+    """An enum value outside its options fails ``value_to_native`` in phase 1:
+    no PVA post happens either, unlike 0.1.4's partial set."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+    out[MIXED_ENUM] = "NOT-AN-OPTION"
+
+    with pytest.raises(Exception):
+        runner._post_outputs(out, POST_TS)
+
+    assert [e[0] for e in events] == ["hook"]
+    assert runner._udf == frozenset()
+
+
+def _pack_failing_for(runner: Runner, bad: str) -> None:
+    original = runner._pack_value
+
+    def pack(pv, value, ts=None):
+        if pv == bad:
+            raise RuntimeError(f"cannot pack {pv}")
+        return original(pv, value, ts)
+
+    runner._pack_value = pack
+
+
+def test_post_outputs_a_pack_error_on_a_non_udf_name_skips_only_its_pva_post() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    _pack_failing_for(runner, MIXED_BOOL)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert MIXED_BOOL not in posts
+    assert posts[MIXED_INT] == (3, 6)
+    # its CA value is still written
+    assert _ca(MIXED_BOOL) in _set_params(events)
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+
+def test_post_outputs_a_pack_error_on_a_udf_name_fails_phase_1() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    _pack_failing_for(runner, MIXED_INT)
+
+    with pytest.raises(RuntimeError, match="cannot pack"):
+        runner._post_outputs(_trigger(model), POST_TS)
+
+    assert [e[0] for e in events] == ["hook"]
+    assert runner._udf == frozenset()
+
+
+def test_post_outputs_phase_2_errors_are_logged_per_name_and_never_raise() -> None:
+    import pcaspy
+
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events, fail_set=(_ca(MIXED_FLOAT_OUT),), fail_update=True)
+    runner.pvs[MIXED_INT].fail = True
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert MIXED_INT not in posts
+    assert posts[MIXED_FLOAT_OUT] == (3, 6)
+    # the refused setParam skips only that name; the next udf name still gets its status
+    udf_ca = (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM)
+    assert ("setParamStatus", _ca(MIXED_INT), *udf_ca) in events
+    assert ("setParamStatus", _ca(MIXED_FLOAT_OUT), *udf_ca) not in events
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+
+def test_post_outputs_with_a_hook_skips_a_none_value() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+    out[MIXED_STR] = None
+
+    runner._post_outputs(out, POST_TS)
+
+    assert MIXED_STR not in _posts(events)
+    assert _ca(MIXED_STR) not in _set_params(events)
+    assert ("hook", list(out)) in events
+
+
+def test_post_outputs_a_udf_failure_rolls_the_cycle_back_and_completes_puts() -> None:
+    """A phase-1 failure takes ``_run_cycle``'s existing error path: rollback,
+    and every done callback receives the error."""
+    completions: list = []
+    rolled_back: list = []
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_MALFORMED)
+    runner = _post_runner(model, events)
+    runner.queue = Queue()
+    runner.update_rate = 0.0
+    runner._cached_state = {}
+    runner._reset_to_cached_state = lambda: rolled_back.append(True)
+
+    runner._run_cycle(
+        _item({MIXED_FLOAT_IN: _write(MIXED_SEVERITY_TRIGGER, 4.0)}, done=completions.append)
+    )
+
+    assert rolled_back == [True]
+    assert len(completions) == 1 and "no-such-condition" in completions[0]
+    assert [e[0] for e in events] == ["hook"]

@@ -30,6 +30,7 @@ try:
 except ImportError as exc:
     raise missing_extra("pcaspy", "ca", exc) from exc
 
+from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
 from lume_pva_apg.variables import (
     EnumVariableHandler,
     ScalarVariableHandler,
@@ -93,6 +94,18 @@ MAX_PRECISION = 17
 # description. Compared by exact type: TorchScalarVariableHandler and
 # NDVariableHandler are deliberately absent.
 _DESCRIBED_HANDLERS = (ScalarVariableHandler, SimpleScalarHandler, EnumVariableHandler)
+
+# Conditions a model's output_severity hook may report, each mapped to the
+# alarm it raises: the PVA (severity, status) pair and the CA (alarm, severity)
+# pair handed to pcaspy's setParamStatus.
+_CONDITIONS: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
+    "udf": (
+        (int(epicsAlarmSeverity.INVALID_ALARM), int(epicsAlarmStatus.UDF_STATUS)),
+        (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM),
+    ),
+}
+# The alarm an undefined output carries on each transport.
+_UDF_PVA, _UDF_CA = _CONDITIONS["udf"]
 
 
 def _resolve_pv_meta(
@@ -228,6 +241,14 @@ class Runner:
     # Validated precision/description per served variable name. The class
     # default lets a Runner built without __init__ read it; __init__ replaces it.
     _pv_meta: MappingProxyType | dict[str, dict[str, Any]] = MappingProxyType({})
+    # Names whose served value is undefined: _generate_value overlays
+    # (INVALID_ALARM, UDF_STATUS) on them. Immutable, and empty by default so a
+    # Runner built without __init__ publishes exactly as 0.1.4 did.
+    _udf: frozenset[str] = frozenset()
+    # The names this cycle asked ``model.get`` for. ``_post_outputs`` evaluates
+    # severity over these only: ``LUMEModel.get`` validates just the requested
+    # names, so any extra key a model's ``_get`` returned is unvalidated.
+    _cycle_requested_names: tuple[str, ...] = ()
 
     class Handler:
         """
@@ -249,6 +270,14 @@ class Runner:
                 return
 
             value = self.runner._clamp_write(self.variable, op.value())
+            # The alarm is the server's to set, never the client's: a put that
+            # carried alarm fields must not overwrite a standing alarm (such as
+            # an undefined output's INVALID/UDF) through either echo below.
+            # SharedPV.post stores only marked fields, so unmarking them keeps
+            # the stored alarm. Each leaf is unmarked on its own because
+            # unmarking the "alarm" parent leaves the leaves marked.
+            for field in ("alarm.severity", "alarm.status", "alarm.message"):
+                value.mark(field, False)
 
             def _complete(error: str | None) -> None:
                 # The echo is the value the model was given, so it may only be
@@ -322,6 +351,12 @@ class Runner:
                 # request leaves the PV holding a value that never landed.
                 if accepted or self.runner.echo_unconfirmed_writes:
                     self.setParam(reason, value)
+                # setParam recomputes the alarm from the value, which would
+                # clear a standing UDF the model reported on the last cycle.
+                # Restated whether or not setParam ran, and before the refusal
+                # alarm so a refusal still reads as the latest word.
+                if vn in self.runner._udf:
+                    self.setParamStatus(reason, *_UDF_CA)
                 if not accepted and self.runner.alarm_on_refused_write:
                     # Put-completion can only ever report success, so an alarm
                     # is the sole channel available to tell the client its write
@@ -392,6 +427,9 @@ class Runner:
         self.var_to_pv = {}
         self.ca_pvs = {}
         self._pv_meta = {}
+        # Must be set before the PVs are built: _add_pv's initial value goes
+        # through _generate_value, which reads it.
+        self._udf = frozenset()
         # Base name of the reset control PV -- the key it holds in the pvdb, and
         # the reason the CA driver is called back with. Empty when control PVs
         # are suppressed.
@@ -811,6 +849,65 @@ class Runner:
         """
         return list(self.model.supported_variables)
 
+    def _evaluate_severity(self, names: list[str]) -> frozenset[str]:
+        """
+        Ask the model which of ``names`` are undefined this cycle.
+
+        A model opts in by defining a callable ``output_severity(names)``; it is
+        called once and must return a dict mapping a variable name to
+        ``{"condition": <condition>}``, where the only known condition is
+        ``"udf"`` (see ``_CONDITIONS``). Keys outside ``names`` are ignored --
+        the model may report on variables this cycle does not publish. The
+        result depends only on the model's reply; runner state is not touched.
+
+        Parameters
+        ----------
+        names : list[str]
+            Variable names published this cycle.
+
+        Returns
+        -------
+        frozenset[str] :
+            The names reported ``"udf"``; empty when the model has no hook.
+
+        Raises
+        ------
+        ValueError
+            The reply is not a dict, or an entry for a requested name is not a
+            dict carrying a known condition. An exception raised by the hook
+            itself propagates unchanged.
+        """
+        hook = getattr(self.model, "output_severity", None)
+        if not callable(hook):
+            return frozenset()
+
+        reply = hook(names)
+        if not isinstance(reply, dict):
+            raise ValueError(
+                f"output_severity must return a dict, got {type(reply).__name__}: {reply!r}"
+            )
+
+        requested = set(names)
+        udf = set()
+        for name, entry in reply.items():
+            if name not in requested:
+                continue
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"output_severity entry for variable '{name}' must be a dict "
+                    f"with a 'condition' key, got {entry!r}"
+                )
+            condition = entry.get("condition")
+            # isinstance first: an unhashable condition would make the
+            # membership test raise TypeError instead of this ValueError.
+            if not isinstance(condition, str) or condition not in _CONDITIONS:
+                raise ValueError(
+                    f"output_severity reported unknown condition {condition!r} for "
+                    f"variable '{name}'; known conditions: {sorted(_CONDITIONS)}"
+                )
+            udf.add(name)
+        return frozenset(udf)
+
     def _extend_pvdb(self) -> dict[str, dict[str, Any]]:
         """
         Additional entries to serve alongside the model's own CA PVs.
@@ -907,8 +1004,15 @@ class Runner:
         Generates a new value for posting to the PV.
         Handles alarm updates, timestamp updates, and generating the value in the first place. This handles the
         'common' metadata that the variable handlers shouldn't need to handle.
+
+        A name in ``self._udf`` is published with (INVALID_ALARM, UDF_STATUS)
+        in place of the handler's alarm pair. :meth:`_pack_value` never applies
+        that overlay.
         """
-        return self._pack_value(pv, value, ts)
+        v = self._pack_value(pv, value, ts)
+        if pv in self._udf:
+            v["alarm"]["severity"], v["alarm"]["status"] = _UDF_PVA
+        return v
 
     def _pack_value(self, pv: str, value: Any | None, ts: float | None = None) -> Value:
         """
@@ -1061,6 +1165,7 @@ class Runner:
 
                 # Get new simulated values
                 output_names = self._cycle_output_names()
+                self._cycle_requested_names = tuple(output_names)
                 out_values = {}
                 if output_names:
                     get_start = time.perf_counter()
@@ -1098,6 +1203,17 @@ class Runner:
         back to its cached state and every waiting put is completed with the
         error.
 
+        A model without a callable ``output_severity`` is published exactly as
+        0.1.4 published it. A model with one is published in two phases, all or
+        nothing. Phase 1 -- the only phase that may raise -- asks the model
+        which names are undefined, builds every PVA Value with an explicit alarm
+        pair and every CA native value, then swaps ``self._udf``. Phase 2
+        publishes what phase 1 built and never raises. A phase-1 failure
+        therefore posts nothing on either transport and leaves ``self._udf`` as
+        it was. Only names this cycle requested are considered:
+        ``LUMEModel.get`` validates those alone, so an extra key a model's
+        ``_get`` returned is neither shown to the hook nor published.
+
         Parameters
         ----------
         out_values : dict[str, Any]
@@ -1105,38 +1221,114 @@ class Runner:
         ts : float
             Timestamp to stamp the published values with.
         """
-        LOG.debug(f"writing {len(out_values)} PVs")
-        for k, v in out_values.items():
-            # The model may return None for an output; there is nothing
-            # meaningful to post, and passing it downstream would either
-            # silently substitute the variable default (PVA path) or raise
-            # in value_to_native (CA path). Skip and warn instead.
+        if not callable(getattr(self.model, "output_severity", None)):
+            LOG.debug(f"writing {len(out_values)} PVs")
+            for k, v in out_values.items():
+                # The model may return None for an output; there is nothing
+                # meaningful to post, and passing it downstream would either
+                # silently substitute the variable default (PVA path) or raise
+                # in value_to_native (CA path). Skip and warn instead.
+                if v is None:
+                    LOG.warning(f"Model returned None for output '{k}'; skipping update")
+                    continue
+
+                # Update PVA component
+                pv = self.pvs.get(k)
+                if pv is not None:
+                    try:
+                        pv.post(self._generate_value(k, v, ts))
+                    except Exception as e:
+                        LOG.error(f"Error posting value for {k}: {e}")
+
+                # Update CA component
+                capv = self.ca_pvs.get(k)
+                if capv is not None and self.ca_driver is not None:
+                    # pcaspy can only understand native python types, not necessarily what the model gives us.
+                    nv = self.pv_handlers[k].value_to_native(self.model.supported_variables[k], v)
+
+                    self.ca_driver.setParam(
+                        capv,
+                        nv,
+                        pcaspy.cas.epicsTimeStamp.fromPosixTimeStamp(ts),
+                    )
+
+            if self.ca_driver is not None:
+                self.ca_driver.updatePVs()
+            return
+
+        requested = set(self._cycle_requested_names)
+        names = [n for n in out_values if n in requested]
+
+        # ---- phase 1: evaluate, build, swap ----
+        udf = self._evaluate_severity(names)
+
+        pva_values: list[tuple[str, Any]] = []
+        ca_values: list[tuple[str, Any, bool]] = []
+        for k in names:
+            v = out_values[k]
             if v is None:
                 LOG.warning(f"Model returned None for output '{k}'; skipping update")
                 continue
 
-            # Update PVA component
-            pv = self.pvs.get(k)
-            if pv is not None:
+            if self.pvs.get(k) is not None:
                 try:
-                    pv.post(self._generate_value(k, v, ts))
+                    packed = self._pack_value(k, v, ts)
+                    # Write the pair on every post: p4p's SharedPV.post stores
+                    # only marked fields, so an unwritten pair would leave a
+                    # recovered output stuck at the previous INVALID.
+                    if k in udf:
+                        severity, status = _UDF_PVA
+                    elif packed.changed("alarm.severity"):
+                        severity = packed["alarm"]["severity"]
+                        status = packed["alarm"]["status"]
+                    else:
+                        severity, status = 0, 0
+                    packed["alarm"]["severity"] = severity
+                    packed["alarm"]["status"] = status
+                    pva_values.append((k, packed))
                 except Exception as e:
+                    # An undefined name must reach clients as undefined; one
+                    # that cannot be packed fails the cycle instead.
+                    if k in udf:
+                        raise
                     LOG.error(f"Error posting value for {k}: {e}")
 
-            # Update CA component
             capv = self.ca_pvs.get(k)
             if capv is not None and self.ca_driver is not None:
-                # pcaspy can only understand native python types, not necessarily what the model gives us.
                 nv = self.pv_handlers[k].value_to_native(self.model.supported_variables[k], v)
+                ca_values.append((capv, nv, k in udf))
 
+        # Names this cycle did not read keep their state.
+        self._udf = (self._udf - set(names)) | udf
+
+        # ---- phase 2: publish; nothing below may raise ----
+        LOG.debug(f"writing {len(names)} PVs")
+        for k, packed in pva_values:
+            try:
+                self.pvs[k].post(packed)
+            except Exception as e:
+                LOG.error(f"Error posting value for {k}: {e}")
+
+        if self.ca_driver is None:
+            return
+
+        for capv, nv, is_udf in ca_values:
+            try:
                 self.ca_driver.setParam(
                     capv,
                     nv,
                     pcaspy.cas.epicsTimeStamp.fromPosixTimeStamp(ts),
                 )
+                # setParam recomputes the alarm, so the UDF status follows it.
+                if is_udf:
+                    self.ca_driver.setParamStatus(capv, *_UDF_CA)
+            except Exception as e:
+                LOG.error(f"Error writing CA value for {capv}: {e}")
 
-        if self.ca_driver is not None:
+        try:
             self.ca_driver.updatePVs()
+        except Exception as e:
+            LOG.error(f"Error flushing CA values: {e}")
 
     def run(self):
         """
