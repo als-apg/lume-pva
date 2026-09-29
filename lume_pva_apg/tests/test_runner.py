@@ -11,6 +11,7 @@ the constructor rejects binds no port; nothing here starts a server or makes a
 network call.
 """
 
+import time
 from queue import Queue
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ try:
     from lume.variables import NDVariable, ScalarVariable, Variable
 
     from lume_pva_apg.runner import Runner
+    from lume_pva_apg.variables import find_variable_handler
 except ImportError as exc:
     skip_if_absent(exc)
 
@@ -800,7 +802,25 @@ def test_model_info_lists_only_configured_variables(model: StubModel) -> None:
 
     runner._create_model_info()
 
-    info = runner.pvs["model_info"].current()
+    info = runner.pvs["MODEL_INFO"].current()
     listed = [(v["name"], v["pvname"], v["mode"]) for v in info["supported_variables"]]
     assert listed == [("input_a", "input_a", "rw")]
-    assert "model_info" in runner.providers
+    assert "MODEL_INFO" in runner.providers
+
+
+def test_published_values_carry_wall_clock_timestamps(model: StubModel) -> None:
+    """A served value is stamped with UNIX time, never the monotonic clock.
+
+    ``_generate_value`` without an explicit ``ts`` is the path every
+    subclass-published value takes. Stamping it from the monotonic clock
+    puts every timestamp a client sees in January 1970."""
+    runner = _make_model_info_stub(model, {})
+    var = model.supported_variables["input_a"]
+    handler = find_variable_handler(type(var))
+    runner.pv_handlers = {"input_a": handler}
+    runner.types = {"input_a": handler.create_type(var)}
+    before = time.time()
+    value = runner._generate_value("input_a", 1.0)
+    after = time.time()
+    stamped = value["timeStamp"]["secondsPastEpoch"] + value["timeStamp"]["nanoseconds"] / 1e9
+    assert before - 1.0 <= stamped <= after + 1.0

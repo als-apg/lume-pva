@@ -2,6 +2,7 @@ import logging
 import math
 import numbers
 import os
+import platform
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -29,6 +30,11 @@ except ImportError as exc:
     raise missing_extra("pcaspy", "ca", exc) from exc
 
 from lume_pva_apg.variables import VariableHandler, find_variable_handler
+
+try:
+    from ._version import version as lume_pva_version
+except ImportError:
+    lume_pva_version = "HEAD"
 
 LOG = logging.getLogger("LumePva")
 logging.getLogger("pcaspy").setLevel(logging.WARNING)
@@ -154,7 +160,7 @@ class Runner:
 
             # Update PVs in simulator
             self.runner._enqueue(
-                {self.variable.name: {"value": value, "ts": time.monotonic()}},
+                {self.variable.name: {"value": value, "ts": time.time()}},
                 done=_complete,
             )
             if self.runner.echo_unconfirmed_writes:
@@ -241,7 +247,7 @@ class Runner:
                 self.callbackPV(reason)
 
             self.runner._enqueue(
-                {vn: {"value": nv, "ts": time.monotonic()}},
+                {vn: {"value": nv, "ts": time.time()}},
                 done=_complete_put,
             )
             return True
@@ -601,7 +607,7 @@ class Runner:
 
     def _create_model_info(self):
         """Creates a model info PV for PVA"""
-        pv = "model_info"
+        pv = "MODEL_INFO"
 
         envs = [
             "EPICS_CA_ADDR_LIST",
@@ -621,6 +627,8 @@ class Runner:
             [
                 ("class", "s"),
                 ("description", "s"),
+                ("lume_pva_version", "s"),
+                ("hostname", "s"),
                 (
                     "env",
                     ("S", None, [(x, "s") for x in envs]),
@@ -645,6 +653,8 @@ class Runner:
         val = Value(self.types[pv])
         val["class"] = self.model.__class__.__name__
         val["description"] = self.config["description"]
+        val["lume_pva_version"] = lume_pva_version
+        val["hostname"] = platform.node()
 
         for e in envs:
             val["env"][e] = os.environ.get(e, "")
@@ -792,7 +802,7 @@ class Runner:
         Helper to update timestamp on a value
         """
         if ts is None:
-            ts = time.monotonic()
+            ts = time.time()
         value["timeStamp"]["nanoseconds"] = math.fmod(ts, 1.0) * 1e9
         value["timeStamp"]["secondsPastEpoch"] = int(ts)
 
@@ -889,7 +899,7 @@ class Runner:
 
             # Use current time if we're missing a latest timestamp
             if latest_ts <= 0:
-                latest_ts = time.monotonic()
+                latest_ts = time.time()
 
             # Stash previous state
             settable_var_names = [
