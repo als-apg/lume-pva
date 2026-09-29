@@ -25,10 +25,24 @@ from lume_pva_apg.tests._requires import skip_if_absent
 # than failing collection, which would take the whole suite with it.
 try:
     from lume.model import LUMEModel
-    from lume.variables import NDVariable, ScalarVariable, Variable
+    from lume.variables import (
+        BoolVariable,
+        EnumVariable,
+        IntVariable,
+        NDVariable,
+        ParticleGroupVariable,
+        ScalarVariable,
+        StrVariable,
+        Variable,
+    )
 
-    from lume_pva_apg.runner import Runner
-    from lume_pva_apg.variables import find_variable_handler
+    from lume_pva_apg.runner import Runner, _resolve_pv_meta
+    from lume_pva_apg.variables import (
+        TORCH_AVAILABLE,
+        TorchNDVariable,
+        TorchScalarVariable,
+        find_variable_handler,
+    )
 except ImportError as exc:
     skip_if_absent(exc)
 
@@ -824,3 +838,324 @@ def test_published_values_carry_wall_clock_timestamps(model: StubModel) -> None:
     after = time.time()
     stamped = value["timeStamp"]["secondsPastEpoch"] + value["timeStamp"]["nanoseconds"] / 1e9
     assert before - 1.0 <= stamped <= after + 1.0
+
+
+def _meta_stub(var: Variable, meta: dict | None = None) -> Runner:
+    """A server-free runner packing ``var`` under the name ``x``, its type built
+    the way ``__init__`` builds it for ``meta``."""
+    runner = _make_model_info_stub(StubModel({"x": var}), {})
+    handler = find_variable_handler(type(var))
+    runner.pv_handlers = {"x": handler}
+    if meta is not None:
+        runner._pv_meta = {"x": meta}
+    runner.types = {"x": handler.create_type(var, **runner._precision_kwargs("x"))}
+    return runner
+
+
+@pytest.mark.parametrize(
+    "var, value",
+    [
+        pytest.param(ScalarVariable(name="x", value_range=(0.0, 10.0), unit="mm"), 2.5, id="float"),
+        pytest.param(EnumVariable(name="x", options=["A", "B", "C"]), "B", id="enum"),
+    ],
+)
+def test_generate_value_and_pack_value_agree(var: Variable, value: object) -> None:
+    """``_generate_value`` delegates to ``_pack_value``: with the same fixed
+    timestamp both produce the same fields and the same changed set."""
+    runner = _meta_stub(var)
+    ts = 1_700_000_000.25
+
+    generated = runner._generate_value("x", value, ts)
+    packed = runner._pack_value("x", value, ts)
+
+    assert generated.todict() == packed.todict()
+    assert generated.changedSet() == packed.changedSet()
+    assert packed["timeStamp"]["secondsPastEpoch"] == 1_700_000_000
+
+
+# --- precision / description metadata (F1.1) --------------------------------
+
+
+class DescribedScalarVariable(ScalarVariable):
+    """A ScalarVariable carrying lume-base 0.6's ``description`` field, declared
+    here so the fallback is testable against a lume-base that predates it."""
+
+    description: str | None = None
+
+
+class DescribedNDVariable(NDVariable):
+    description: str | None = None
+
+
+def _meta(var: Variable, **entry: object) -> dict:
+    handler = find_variable_handler(type(var))
+    assert handler is not None
+    return _resolve_pv_meta(var.name, {"name": var.name, **entry}, var, handler)
+
+
+def _nd() -> NDVariable:
+    return NDVariable(name="arr", shape=(2,), dtype=np.float64)
+
+
+def _torch_meta_cases() -> list:
+    if not TORCH_AVAILABLE:
+        return []
+    import torch
+
+    return [
+        pytest.param(TorchScalarVariable(name="ts"), id="torch-scalar"),
+        pytest.param(TorchNDVariable(name="tnd", shape=(2,), dtype=torch.float32), id="torch-nd"),
+    ]
+
+
+def test_an_entry_without_meta_keys_resolves_to_none() -> None:
+    assert _meta(ScalarVariable(name="x")) == {"precision": None, "description": None}
+
+
+@pytest.mark.parametrize("precision", [0, 3, 17])
+def test_a_precision_in_range_on_a_float_scalar_is_kept(precision: int) -> None:
+    assert _meta(ScalarVariable(name="x"), precision=precision)["precision"] == precision
+
+
+@pytest.mark.parametrize(
+    "precision",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(18, id="above-17"),
+        pytest.param(True, id="bool"),
+        pytest.param(2.0, id="float"),
+        pytest.param("3", id="str"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_a_malformed_precision_is_rejected(precision: object) -> None:
+    """``type(p) is int`` and 0..17: a bool is an int to isinstance, but True
+    is not a digit count, and an explicit None is a typo rather than an absence."""
+    with pytest.raises(ValueError, match=r"x.*'precision'"):
+        _meta(ScalarVariable(name="x"), precision=precision)
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        pytest.param(IntVariable(name="v"), id="int"),
+        pytest.param(BoolVariable(name="v"), id="bool"),
+        pytest.param(StrVariable(name="v"), id="str"),
+        pytest.param(EnumVariable(name="v", options=["A", "B"]), id="enum"),
+        pytest.param(NDVariable(name="v", shape=(2,), dtype=np.float64), id="nd"),
+        *_torch_meta_cases(),
+    ],
+)
+def test_a_precision_on_anything_but_a_float_scalar_is_rejected(var: Variable) -> None:
+    """Only a float NTScalar has digits after the decimal point to limit;
+    IntVariable shares the float handler, so it is excluded by type."""
+    with pytest.raises(ValueError, match=f"{var.name}.*'precision'"):
+        _meta(var, precision=3)
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        pytest.param(ScalarVariable(name="v"), id="float"),
+        pytest.param(IntVariable(name="v"), id="int"),
+        pytest.param(BoolVariable(name="v"), id="bool"),
+        pytest.param(StrVariable(name="v"), id="str"),
+        pytest.param(EnumVariable(name="v", options=["A", "B"]), id="enum"),
+    ],
+)
+def test_a_config_description_is_kept_on_every_display_type(var: Variable) -> None:
+    assert _meta(var, description="beam current")["description"] == "beam current"
+
+
+@pytest.mark.parametrize("description", [pytest.param(3, id="int"), pytest.param(None, id="none")])
+def test_a_non_str_description_is_rejected(description: object) -> None:
+    with pytest.raises(ValueError, match=r"x.*'description'"):
+        _meta(ScalarVariable(name="x"), description=description)
+
+
+@pytest.mark.parametrize("var", [pytest.param(_nd(), id="nd"), *_torch_meta_cases()])
+def test_a_config_description_on_an_array_or_torch_variable_is_rejected(var: Variable) -> None:
+    """These PVA types have no display block to carry it; accepted, it would
+    be silently dropped."""
+    with pytest.raises(ValueError, match=f"{var.name}.*'description'"):
+        _meta(var, description="beam current")
+
+
+def test_an_empty_config_description_means_none_and_beats_the_variable() -> None:
+    var = DescribedScalarVariable(name="x", description="from the model")
+    assert _meta(var, description="")["description"] is None
+
+
+def test_the_variable_description_is_the_fallback() -> None:
+    var = DescribedScalarVariable(name="x", description="from the model")
+    assert _meta(var)["description"] == "from the model"
+    assert _meta(var, description="from config")["description"] == "from config"
+
+
+def test_an_empty_variable_description_means_none() -> None:
+    assert _meta(DescribedScalarVariable(name="x", description=""))["description"] is None
+
+
+def test_a_variable_description_on_an_array_is_ignored_not_rejected() -> None:
+    """A lume-base 0.6 model may describe an array; it must still boot."""
+    var = DescribedNDVariable(
+        name="arr", shape=(2,), dtype=np.dtype(np.float64), description="an image"
+    )
+    assert _meta(var) == {"precision": None, "description": None}
+
+
+def test_resolving_meta_never_mutates_the_entry_or_the_variable() -> None:
+    var = DescribedScalarVariable(name="x", description="from the model")
+    entry = {"name": "x", "precision": 2}
+    before = var.model_dump()
+    _resolve_pv_meta("x", entry, var, find_variable_handler(type(var)))
+    assert entry == {"name": "x", "precision": 2}
+    assert var.model_dump() == before
+
+
+def test_a_bad_meta_entry_is_rejected_before_any_server_exists(
+    model: StubModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import p4p.server
+    import pcaspy
+
+    def no_server(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a server was created before validation failed")
+
+    monkeypatch.setattr(p4p.server, "Server", no_server)
+    monkeypatch.setattr(pcaspy, "SimpleServer", no_server)
+    config = Runner.generate_config(model)
+    config["variables"]["input_a"]["precision"] = 99
+
+    with pytest.raises(ValueError, match=r"input_a.*'precision'"):
+        Runner(model=model, config=config)
+
+
+def test_the_runner_class_default_pv_meta_is_empty_and_read_only() -> None:
+    runner = Runner.__new__(Runner)
+    assert dict(runner._pv_meta) == {}
+    with pytest.raises(TypeError):
+        runner._pv_meta["x"] = {}  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "skipped",
+    [
+        pytest.param(ParticleGroupVariable(name="skipped"), id="particle-group"),
+        pytest.param(
+            NDVariable(name="skipped", shape=(2,), dtype=np.complex128), id="unsupported-nd"
+        ),
+    ],
+)
+def test_a_skipped_variable_carrying_a_description_is_skipped_not_rejected(
+    skipped: Variable,
+) -> None:
+    """Validation runs after the skips, so 0.1.4's warn-and-skip is unchanged.
+
+    A typo-named entry after the skipped one stops the constructor with a
+    KeyError before any server exists: reaching it proves the skipped entry's
+    description and precision raised nothing.
+    """
+    model = StubModel({"skipped": skipped})
+    config = Runner.generate_config(model)
+    config["variables"]["skipped"]["description"] = "not servable"
+    config["variables"]["skipped"]["precision"] = 3
+    config["variables"]["later"] = {"name": "later_typo", "pv": "later"}
+
+    with pytest.raises(KeyError, match="later_typo"):
+        Runner(model=model, config=config)
+
+
+# --- precision / description wiring (F1.3, F1.4) ---------------------------
+
+
+def test_a_configured_precision_is_packed_as_display_precision() -> None:
+    runner = _meta_stub(ScalarVariable(name="x"), {"precision": 4, "description": None})
+
+    packed = runner._pack_value("x", 1.25)
+
+    assert packed["display"]["precision"] == 4
+    assert "format" not in packed["display"].keys()
+
+
+def test_a_float_without_precision_keeps_its_0_1_4_display_block() -> None:
+    runner = _meta_stub(ScalarVariable(name="x"), {"precision": None, "description": None})
+
+    packed = runner._pack_value("x", 1.25)
+
+    assert "precision" not in packed["display"].keys()
+    assert "format" in packed["display"].keys()
+
+
+@pytest.mark.parametrize(
+    "var, value",
+    [
+        pytest.param(ScalarVariable(name="x"), 1.0, id="float"),
+        pytest.param(IntVariable(name="x"), 2, id="int"),
+        pytest.param(BoolVariable(name="x"), True, id="bool"),
+        pytest.param(StrVariable(name="x"), "s", id="str"),
+        pytest.param(EnumVariable(name="x", options=["A", "B"]), "B", id="enum"),
+    ],
+)
+def test_a_configured_description_is_packed_as_display_description(
+    var: Variable, value: object
+) -> None:
+    runner = _meta_stub(var, {"precision": None, "description": "what it is"})
+
+    packed = runner._pack_value("x", value)
+
+    assert packed["display"]["description"] == "what it is"
+
+
+def test_an_nd_variable_is_packed_without_display_metadata() -> None:
+    """The ND handler's type has no display block; the runner must not write one."""
+    runner = _meta_stub(_nd(), {"precision": None, "description": None})
+
+    packed = runner._pack_value("x", np.zeros(2))
+
+    assert "display" not in packed.keys()
+
+
+def test_precision_is_passed_only_to_a_float_scalar_handler() -> None:
+    """``create_type``/``ca_pvspec`` get a ``precision`` keyword only from a
+    ScalarVariableHandler with one configured; every other call is 0.1.4's."""
+    runner = _make_model_info_stub(StubModel({}), {})
+    runner.pv_handlers = {
+        "float": find_variable_handler(ScalarVariable),
+        "plain": find_variable_handler(ScalarVariable),
+        "enum": find_variable_handler(EnumVariable),
+    }
+    runner._pv_meta = {
+        "float": {"precision": 3, "description": None},
+        "plain": {"precision": None, "description": None},
+        "enum": {"precision": 3, "description": None},
+    }
+
+    assert runner._precision_kwargs("float") == {"precision": 3}
+    assert runner._precision_kwargs("plain") == {}
+    assert runner._precision_kwargs("enum") == {}
+    assert runner._precision_kwargs("unknown") == {}
+
+
+@pytest.mark.parametrize(
+    "var, meta, expected",
+    [
+        pytest.param(ScalarVariable(name="x"), {"precision": 2}, 2, id="configured"),
+        pytest.param(ScalarVariable(name="x"), {"precision": None}, None, id="unconfigured"),
+        pytest.param(IntVariable(name="x"), None, None, id="int-no-meta"),
+    ],
+)
+def test_add_pv_puts_a_configured_precision_in_the_ca_pvspec(
+    var: Variable, meta: dict | None, expected: int | None
+) -> None:
+    """``_add_pv`` reads the precision from ``_pv_meta``: ``prec`` is in the
+    pvdb spec exactly when one is configured."""
+    runner = _meta_stub(var, meta)
+    runner.supports_pva = False
+    runner.supports_ca = True
+    runner.pvdb = {}
+    runner.ca_pvs = {}
+
+    runner._add_pv("X_PV", var, ro=False, prefix="", handler=runner.pv_handlers["x"])
+
+    assert runner.pvdb["X_PV"].get("prec") == expected

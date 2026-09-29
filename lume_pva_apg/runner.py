@@ -7,10 +7,11 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from queue import Empty, Queue
-from typing import Any, TypedDict
+from types import MappingProxyType
+from typing import Any, NotRequired, TypedDict
 
 from lume.model import LUMEModel, Variable
-from lume.variables import ParticleGroupVariable
+from lume.variables import IntVariable, ParticleGroupVariable
 
 from lume_pva_apg._optional import missing_extra
 
@@ -29,7 +30,13 @@ try:
 except ImportError as exc:
     raise missing_extra("pcaspy", "ca", exc) from exc
 
-from lume_pva_apg.variables import VariableHandler, find_variable_handler
+from lume_pva_apg.variables import (
+    EnumVariableHandler,
+    ScalarVariableHandler,
+    SimpleScalarHandler,
+    VariableHandler,
+    find_variable_handler,
+)
 
 try:
     from ._version import version as lume_pva_version
@@ -60,11 +67,103 @@ class RunnerVariable(TypedDict):
         - 'ro': Read-only PV served by this server
         - 'rw': Read-write PV served by this server. Errors if Variable.read_only
         Default is 'rw'
+    precision : int, optional
+        Number of digits after the decimal point a display client shows. An int
+        in 0..17 (the significant digits a double carries), allowed only on a
+        float ``ScalarVariable``.
+    description : str, optional
+        Text served as the PV's description. Overrides the variable's own
+        ``description`` (lume-base 0.6); ``""`` means none. Rejected on array
+        and Torch variables, whose PVs carry no display block.
     """
 
     name: str
     pv: str
     mode: str
+    precision: NotRequired[int]
+    description: NotRequired[str]
+
+
+# Upper bound on a configured precision: the significant decimal digits an
+# IEEE double carries. A policy bound -- CA's dbr_short field would take more,
+# but no digit past the 17th means anything.
+MAX_PRECISION = 17
+
+# Handlers whose PVA type carries a display block, and so can serve a
+# description. Compared by exact type: TorchScalarVariableHandler and
+# NDVariableHandler are deliberately absent.
+_DESCRIBED_HANDLERS = (ScalarVariableHandler, SimpleScalarHandler, EnumVariableHandler)
+
+
+def _resolve_pv_meta(
+    name: str,
+    entry: RunnerVariable | dict,
+    variable: Variable,
+    handler: VariableHandler,
+) -> dict[str, Any]:
+    """Validate a config entry's ``precision`` and ``description``.
+
+    Parameters
+    ----------
+    name : str
+        Variable name, used in error messages.
+    entry : RunnerVariable
+        The variable's config entry. Only read.
+    variable : Variable
+        The model's variable. Only read.
+    handler : VariableHandler
+        The handler resolved for ``variable``; never None.
+
+    Returns
+    -------
+    dict
+        ``{"precision": int | None, "description": str | None}``. A
+        description of ``""`` -- configured or from the variable -- is None.
+
+    Raises
+    ------
+    ValueError
+        A key is malformed or not allowed on this variable's type.
+    """
+    handler_type = type(handler)
+
+    precision = entry.get("precision")
+    if "precision" in entry:
+        # type() rather than isinstance: bool is an int subclass, and True is
+        # not a precision.
+        if type(precision) is not int or not 0 <= precision <= MAX_PRECISION:
+            raise ValueError(
+                f"Variable {name}: 'precision' must be an int in 0..{MAX_PRECISION}, "
+                f"got {precision!r}"
+            )
+        # IntVariable shares ScalarVariableHandler but is served as an integer
+        # NTScalar, where digits after the decimal point mean nothing.
+        if handler_type is not ScalarVariableHandler or isinstance(variable, IntVariable):
+            raise ValueError(
+                f"Variable {name}: 'precision' is only allowed on a float scalar variable, "
+                f"not {type(variable).__name__}"
+            )
+
+    described = handler_type in _DESCRIBED_HANDLERS
+    if "description" in entry:
+        description = entry["description"]
+        if not isinstance(description, str):
+            raise ValueError(
+                f"Variable {name}: 'description' must be a str, got {type(description).__name__}"
+            )
+        if not described:
+            raise ValueError(
+                f"Variable {name}: 'description' is not supported on {type(variable).__name__}"
+            )
+    elif described:
+        # lume-base 0.6 added Variable.description; older versions lack it.
+        description = getattr(variable, "description", None)
+    else:
+        # A model-side description on an array or Torch variable is ignored,
+        # so a lume-base 0.6 model carrying one still boots.
+        description = None
+
+    return {"precision": precision, "description": description or None}
 
 
 class RunnerConfig(TypedDict):
@@ -126,6 +225,9 @@ class Runner:
     # List of all output PVs that need to be updated after simulation
     outputs: list[str]
     values: dict[str, Value]
+    # Validated precision/description per served variable name. The class
+    # default lets a Runner built without __init__ read it; __init__ replaces it.
+    _pv_meta: MappingProxyType | dict[str, dict[str, Any]] = MappingProxyType({})
 
     class Handler:
         """
@@ -289,6 +391,7 @@ class Runner:
         self.pv_to_var: dict[str, str] = {}  # Map pv name -> variable name
         self.var_to_pv = {}
         self.ca_pvs = {}
+        self._pv_meta = {}
         # Base name of the reset control PV -- the key it holds in the pvdb, and
         # the reason the CA driver is called back with. Empty when control PVs
         # are suppressed.
@@ -359,9 +462,13 @@ class Runner:
                 LOG.warning(f'Unsupported variable "{var.name}". Skipping.')
                 continue
 
+            # Validated only for a variable that is served: a skipped one keeps
+            # its warn-and-skip, whatever its entry carries.
+            self._pv_meta[var.name] = _resolve_pv_meta(c["name"], c, var, handler)
+
             # Cache handler and type for later
             self.pv_handlers[var.name] = handler
-            self.types[var.name] = handler.create_type(var)
+            self.types[var.name] = handler.create_type(var, **self._precision_kwargs(var.name))
 
             self.pv_to_var[pv] = var.name
             self.var_to_pv[var.name] = pv
@@ -595,7 +702,7 @@ class Runner:
                 return
 
             LOG.debug(f"Creating CA PV: pv={pv}")
-            spec = handler.ca_pvspec(var)
+            spec = handler.ca_pvspec(var, **self._precision_kwargs(var.name))
 
             # Keyed by the base name: SimpleServer.createPV prepends the prefix
             # to build the served name, and every callback into the driver --
@@ -783,15 +890,43 @@ class Runner:
 
         return None
 
+    def _precision_kwargs(self, name: str) -> dict[str, int]:
+        """Return ``{"precision": p}`` for a float scalar configured with one.
+
+        Only ``ScalarVariableHandler`` (compared by exact type) accepts the
+        keyword; every other handler's ``create_type``/``ca_pvspec`` is called
+        exactly as in 0.1.4, and so is a scalar configured without a precision.
+        """
+        precision = self._pv_meta.get(name, {}).get("precision")
+        if precision is None or type(self.pv_handlers.get(name)) is not ScalarVariableHandler:
+            return {}
+        return {"precision": precision}
+
     def _generate_value(self, pv: str, value: Any | None, ts: float | None = None) -> Value:
         """
         Generates a new value for posting to the PV.
         Handles alarm updates, timestamp updates, and generating the value in the first place. This handles the
         'common' metadata that the variable handlers shouldn't need to handle.
         """
-        v = self.pv_handlers[pv].pack_value(
-            self.model.supported_variables[pv], self.types[pv], value
-        )
+        return self._pack_value(pv, value, ts)
+
+    def _pack_value(self, pv: str, value: Any | None, ts: float | None = None) -> Value:
+        """
+        Packs ``value`` for ``pv`` with its handler and stamps it with ``ts``
+        (the current UNIX time when omitted).
+        """
+        handler = self.pv_handlers[pv]
+        variable = self.model.supported_variables[pv]
+        v = handler.pack_value(variable, self.types[pv], value)
+
+        # Display metadata from the configuration. Read with .get so a runner
+        # built without __init__ (class default: empty) packs as 0.1.4 did.
+        meta = self._pv_meta.get(pv, {})
+        precision = meta.get("precision")
+        if precision is not None:
+            v["display"]["precision"] = precision
+        if type(handler) in _DESCRIBED_HANDLERS:
+            handler.set_display_metadata(variable, v, description=meta.get("description"))
 
         # Ensure timestamp is current
         self._update_timestamp(v, ts=ts)

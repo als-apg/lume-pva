@@ -32,6 +32,7 @@ objects that are still alive, which pyepics documents as a route to a random
 SIGSEGV from inside the EPICS libraries.
 """
 
+import inspect
 import itertools
 import multiprocessing
 import os
@@ -62,6 +63,17 @@ try:
     from p4p.client.thread import TimeoutError as PvaTimeoutError
 
     from lume_pva_apg.runner import RESET_CONTROL_PV, Runner
+    from lume_pva_apg.tests._mixed_model import (
+        MIXED_BOOL,
+        MIXED_DEFAULTS,
+        MIXED_ENUM,
+        MIXED_ENUM_OPTIONS,
+        MIXED_FLOAT_IN,
+        MIXED_FLOAT_OUT,
+        MIXED_INT,
+        MIXED_STR,
+        MixedModel,
+    )
 except ImportError as exc:
     skip_if_absent(exc)
 
@@ -177,7 +189,31 @@ _RUNNERS: dict[str, type[Runner]] = {
     "stock": Runner,
     "extend_only": ExtendOnlyRunner,
     "seam": SeamRunner,
+    # The stock runner, serving a MixedModel instead of a SeamModel.
+    "mixed": Runner,
 }
+
+# The model each runner key serves, where it is not SeamModel.
+_MODELS: dict[str, Callable[[mpEvent], LUMEModel]] = {
+    "mixed": MixedModel,
+}
+
+
+def _apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """Merge `overrides` into a generated config.
+
+    Every key replaces the config's own, except ``variables``: that one maps a
+    variable name to the keys to merge into *that variable's* generated entry,
+    so a test can change one variable's ``pv`` or ``mode`` without restating
+    the rest of the config. A name the model does not serve is an error rather
+    than a new entry, so a typo cannot pass as an override that did nothing.
+    """
+    overrides = dict(overrides)
+    for name, entry in overrides.pop("variables", {}).items():
+        if name not in config["variables"]:
+            raise KeyError(f"override names {name!r}, which the model does not serve")
+        config["variables"][name].update(entry)
+    config.update(overrides)
 
 
 def _serve(
@@ -187,15 +223,16 @@ def _serve(
     started: mpEvent,
     ready: mpEvent,
 ) -> None:
-    """Child-process entry point: serve a SeamModel under `prefix`.
+    """Child-process entry point: serve the key's model under `prefix`.
 
+    The model is SeamModel unless ``_MODELS`` names another for `runner_key`.
     Must be importable at module top level so the ``spawn`` start method can
     locate it. Blocks forever once ready; the parent terminates the process.
     """
-    model = SeamModel(started)
+    model = _MODELS.get(runner_key, SeamModel)(started)
     config = Runner.generate_config(model, prefix=prefix)
     config["update_rate"] = 0.0
-    config.update(overrides)
+    _apply_overrides(config, overrides)
 
     runner = _RUNNERS[runner_key](model=model, config=config)
     threading.Thread(target=runner._run, daemon=True).start()
@@ -210,7 +247,12 @@ def _serve(
 
 @pytest.fixture(scope="function")
 def serve() -> Generator[Callable[..., str], None, None]:
-    """Yield a factory that starts a configured Runner and returns its prefix."""
+    """Yield a factory that starts a configured Runner and returns its prefix.
+
+    ``serve(runner_key, **overrides)``: keyword overrides replace config keys,
+    and ``variables={name: {...}}`` is merged into each named variable's
+    generated entry (see :func:`_apply_overrides`).
+    """
     procs: list[Any] = []
 
     def _start(runner_key: str = "stock", **overrides: Any) -> str:
@@ -510,3 +552,115 @@ def test_control_pvs_false_leaves_the_write_path_working(serve) -> None:
 
     assert _read(f"{prefix}{IN_A}") == pytest.approx(1.5)
     assert _read(f"{prefix}{OUT_DOUBLE}") == pytest.approx(3.0)
+
+
+# --------------------------------------------------------------------------
+# harness: a mixed-type model, and per-variable config overrides
+# --------------------------------------------------------------------------
+
+
+def test_mixed_model_serves_every_type_over_ca(serve) -> None:
+    """Float, int, bool, str and enum each reach a CA client with their value."""
+    prefix = serve("mixed")
+
+    assert _read(f"{prefix}{MIXED_FLOAT_IN}") == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+    assert _read(f"{prefix}{MIXED_INT}") == MIXED_DEFAULTS[MIXED_INT]
+    assert _read(f"{prefix}{MIXED_BOOL}") == 1
+    str_value = epics.caget(
+        f"{prefix}{MIXED_STR}", as_string=True, use_monitor=False, timeout=OP_TIMEOUT
+    )
+    assert str_value == MIXED_DEFAULTS[MIXED_STR]
+    assert _read(f"{prefix}{MIXED_ENUM}") == MIXED_ENUM_OPTIONS.index(MIXED_DEFAULTS[MIXED_ENUM])
+
+    ctrl = _ctrlvars(f"{prefix}{MIXED_ENUM}")
+    assert list(ctrl["enum_strs"]) == MIXED_ENUM_OPTIONS
+
+
+def test_mixed_model_serves_every_type_over_pva(serve) -> None:
+    """The same five types reach a PVA client, each as its own normative type."""
+    prefix = serve("mixed")
+
+    with Context("pva") as ctx:
+
+        def raw(name: str) -> Any:
+            return ctx.get(f"{prefix}{name}", timeout=OP_TIMEOUT).raw.value
+
+        assert raw(MIXED_FLOAT_IN) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+        assert raw(MIXED_FLOAT_OUT) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+        assert raw(MIXED_INT) == MIXED_DEFAULTS[MIXED_INT]
+        assert raw(MIXED_BOOL) is True
+        assert raw(MIXED_STR) == MIXED_DEFAULTS[MIXED_STR]
+        enum = raw(MIXED_ENUM)
+        assert list(enum.choices) == MIXED_ENUM_OPTIONS
+        assert enum.index == MIXED_ENUM_OPTIONS.index(MIXED_DEFAULTS[MIXED_ENUM])
+
+
+def test_variable_override_reaches_the_config(serve) -> None:
+    """``variables={name: {...}}`` changes that variable's entry and no other.
+
+    Renaming the PV is observable from outside: the variable is served under
+    the new name, no longer under its own, and its neighbour is untouched.
+    """
+    prefix = serve(variables={IN_A: {"pv": "RENAMED"}})
+
+    assert _read(f"{prefix}RENAMED") == pytest.approx(0.0)
+    _absent(f"{prefix}{IN_A}")
+    _read(f"{prefix}{OUT_DOUBLE}")
+
+
+# --------------------------------------------------------------------------
+# display metadata: a configured precision and description reach the wire
+# --------------------------------------------------------------------------
+
+
+def _pva_raw(prefix: str, name: str) -> Any:
+    """Read a PVA PV's whole structure, metadata included."""
+    with Context("pva") as ctx:
+        return ctx.get(f"{prefix}{name}", timeout=OP_TIMEOUT).raw
+
+
+def test_a_configured_precision_reaches_ca_as_dbr_ctrl_precision(serve) -> None:
+    """``precision: 3`` on a float is the ``precision`` a CA client's DBR_CTRL read reports."""
+    prefix = serve("mixed", variables={MIXED_FLOAT_IN: {"precision": 3}})
+
+    assert _ctrlvars(f"{prefix}{MIXED_FLOAT_IN}")["precision"] == 3
+
+
+def test_a_configured_precision_reaches_pva_as_display_precision(serve) -> None:
+    """``precision: 3`` on a float is served as ``display.precision``; a float
+    configured without one keeps its precision-less display block."""
+    prefix = serve("mixed", variables={MIXED_FLOAT_IN: {"precision": 3}})
+
+    configured = _pva_raw(prefix, MIXED_FLOAT_IN)
+    assert configured["display"]["precision"] == 3
+    assert configured["value"] == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+
+    plain = _pva_raw(prefix, MIXED_FLOAT_OUT)
+    assert "precision" not in plain["display"].keys()
+
+
+@pytest.mark.parametrize(
+    "var_name",
+    [
+        pytest.param(MIXED_FLOAT_IN, id="float"),
+        pytest.param(MIXED_INT, id="int"),
+        pytest.param(MIXED_BOOL, id="bool"),
+        pytest.param(MIXED_STR, id="str"),
+        pytest.param(MIXED_ENUM, id="enum"),
+    ],
+)
+def test_a_configured_description_reaches_pva_as_display_description(serve, var_name: str) -> None:
+    """``description: "x"`` is served as ``display.description`` on every
+    PVA type with a display block, and only on the variable configured with it."""
+    prefix = serve("mixed", variables={var_name: {"description": "x"}})
+
+    assert _pva_raw(prefix, var_name)["display"]["description"] == "x"
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["display"]["description"] == ""
+
+
+def test_precision_and_description_leave_add_pv_signature_unchanged() -> None:
+    """Subclasses call and override ``_add_pv``; the metadata travels through
+    ``_pv_meta`` rather than new parameters, so its signature is 0.1.4's."""
+    params = list(inspect.signature(Runner._add_pv).parameters)
+    assert params == ["self", "pv", "var", "ro", "prefix", "handler"]

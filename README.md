@@ -182,7 +182,9 @@ An example configuration:
         'input_a': {
             'name': 'input_a',
             'pv': 'input_a_pv',
-            'mode': 'rw' # 'rw' means we can read and write this PV
+            'mode': 'rw', # 'rw' means we can read and write this PV
+            'precision': 3, # Optional, float scalars only: display precision (0..17), CA `prec` and PVA `display.precision`
+            'description': 'Input A' # Optional, scalar/str/bool/enum only: PVA `display.description`; defaults to the variable's own description (lume-base >= 0.6)
         },
         'output_b': {
             'name': 'output_b',
@@ -234,6 +236,7 @@ distribution retires once the upstream ones are merged and released.
 | Cover the CA display limits for a variable with a non-default range | Every `ca_pvspec` case used a variable with no range and no unit, so a spec that dropped the limits, zeroed them, or swapped them was indistinguishable from a correct one. |
 | Apply the PV name prefix exactly once on the Channel Access path | `prefix` was written into the pvdb keys and then applied again by `SimpleServer.createPV`, so a runner configured with `PFX:` served `PFX:PFX:name`. The driver names a PV by its pvdb key, so the same mistake left the cycle's output pass calling `setParam` with a name the database did not hold: every cycle raised `KeyError` and was logged as a failed simulation. Keying the database by base name leaves the prefix to the server, which is also what names a PV in every driver callback. Invisible at `prefix=""`, which is what every existing test used. |
 | Serve an `IntVariable` as an int64 NTScalar on PVA | `IntVariable` subclasses `ScalarVariable`, and `create_type` tested for the base class first, so every integer variable was served as an NTScalar double and packed as a float. A PVA client saw a floating-point PV for an integer quantity; testing `IntVariable` first gives it wire code `l` and packs the value as an int. |
+| Configure a variable's display `precision` and `description` | A client had no way to learn how many digits a float is meaningful to, or what a PV is, other than out of band. Both are per-variable configuration keys validated at construction: `precision` (float scalars only) reaches CA as `prec` and PVA as `display.precision`, and `description` — or, without one, the variable's own — reaches PVA as `display.description` on every type with a display block. A float configured without a precision keeps the display fields it had before. |
 
 ### Fork-local changes
 
