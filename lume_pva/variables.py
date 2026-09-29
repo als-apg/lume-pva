@@ -295,10 +295,14 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable], Gener
             value = self.default_value(variable)
 
         # Force cast to int for int variables, otherwise we trip validation
-        if type(variable) is IntVariable:
-            value = int(value)
-        else:
-            value = float(value)
+        try:
+            if type(variable) is IntVariable:
+                value = int(value)
+            else:
+                value = float(value)
+        except Exception():
+            # If we've gotten here, value was probably bad... so raise a type error, same as validation.
+            raise TypeError(f"variable {variable.name} not compatible with type {type(value)}")
 
         variable.validate_value(value)
 
