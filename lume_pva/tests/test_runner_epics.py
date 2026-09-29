@@ -228,6 +228,16 @@ def clear_harness(harness: RunnerHandle) -> None:
     harness.release.clear()
 
 
+def _caget(pvname: str) -> float:
+    """Read ``pvname`` from the server, not from pyepics' monitor cache.
+
+    ``epics.caget`` defaults to ``use_monitor=True``, which returns the last
+    monitor update this client has processed. Right after a put that update may
+    not have arrived yet, so the cache can still hold the previous value.
+    """
+    return float(epics.caget(pvname, timeout=OP_TIMEOUT, use_monitor=False))
+
+
 def _wait_model_post(harness: RunnerHandle, timeout: float) -> bool:
     """Waits for the model to finish simulating and post the results"""
     if harness.put_mode == PutMode.Complete:
@@ -235,7 +245,7 @@ def _wait_model_post(harness: RunnerHandle, timeout: float) -> bool:
     assert harness.completed.wait(timeout)
     start = time.monotonic()
     while time.monotonic() < (timeout + start):
-        if epics.caget("STATUS") == 0:
+        if epics.caget("STATUS", use_monitor=False) == 0:
             return True
         time.sleep(0.1)
     return False
@@ -318,7 +328,7 @@ def test_ca_put_waits_for_simulation(harness: RunnerHandle) -> None:
     else:
         raise ValueError(f"Unknown put_mode {harness.put_mode}")
 
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(14.0)
+    assert _caget("sum_output") == pytest.approx(14.0)
 
 
 def test_status_pv(harness: RunnerHandle):
@@ -357,14 +367,14 @@ def test_standard_sim(harness: RunnerHandle):
     assert _wait_model_post(harness, OP_TIMEOUT)
 
     # assert model set has completed
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(20.0)
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(10.0)
+    assert _caget("sum_output") == pytest.approx(20.0)
+    assert _caget("input_a") == pytest.approx(10.0)
 
 
 def test_failed_sim(harness: RunnerHandle):
     # Assert initial state
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(0.0)
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(0.0)
+    assert _caget("input_a") == pytest.approx(0.0)
+    assert _caget("sum_output") == pytest.approx(0.0)
 
     # Reasonable input
     harness.completed.clear()
@@ -372,8 +382,8 @@ def test_failed_sim(harness: RunnerHandle):
     assert _wait_model_post(harness, OP_TIMEOUT)
 
     # Verify record has processed
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(4.2)
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(8.4)
+    assert _caget("input_a") == pytest.approx(4.2)
+    assert _caget("sum_output") == pytest.approx(8.4)
 
     # attempt set out of bounds - the model should NOT simulate here
     harness.entered.clear()
@@ -381,8 +391,8 @@ def test_failed_sim(harness: RunnerHandle):
     assert not harness.entered.wait(timeout=0.5)
 
     # reverting to previous (cached) value, runner is still operational
-    assert float(epics.caget("input_a", timeout=OP_TIMEOUT)) == pytest.approx(4.2)
-    assert float(epics.caget("sum_output", timeout=OP_TIMEOUT)) == pytest.approx(8.4)
+    assert _caget("input_a") == pytest.approx(4.2)
+    assert _caget("sum_output") == pytest.approx(8.4)
 
 
 def test_pva_reset_calls_model_reset(harness: RunnerHandle) -> None:
