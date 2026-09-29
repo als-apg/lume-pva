@@ -297,10 +297,12 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable], Gener
         # Force cast to int for int variables, otherwise we trip validation
         if isinstance(variable, IntVariable):
             value = int(value)
+        else:
+            value = float(value)
 
         variable.validate_value(value)
 
-        v = Value(type_, {"value": float(value)})
+        v = Value(type_, {"value": value})
         self.set_metadata(variable, v, value)
         return v
 
