@@ -156,6 +156,58 @@ jobs:
           assert not silent, f"shipped but ran nothing without the torch extra: {silent}"
           PY
 
+  suite-on-lume-base-0-5-0:
+    # lume-base is an unpinned core dependency, so every other leg resolves
+    # whatever release is newest on the day it runs. A consumer holding an
+    # older lume-base -- a deployment that locks its environment -- gets none of
+    # that coverage, and a use of API that release lacks passes CI and fails on
+    # their install. 0.5.0 is the oldest release this package is exercised
+    # against; pinning it here, rather than in pyproject.toml, keeps consumers
+    # free to move while proving the floor still works.
+    #
+    # Without the torch extra: lume-torch carries its own lume-base
+    # requirement, and forcing 0.5.0 underneath it would test an environment
+    # no resolver would produce.
+    name: Suite runs on lume-base 0.5.0
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # setuptools_scm derives the version from tags.
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies and package
+        run: |
+          uv sync --extra dev --no-editable
+      - name: Replace lume-base with 0.5.0
+        # After the sync, so the lock's choice is overridden rather than
+        # resolved around; every later uv call passes --no-sync to keep it.
+        run: |
+          uv pip install lume-base==0.5.0
+      - name: lume-base 0.5.0 is the one installed
+        # The leg proves nothing if the sync or a later step quietly restores
+        # a newer release. Checked rather than assumed.
+        run: |
+          uv run --no-sync python -c "import importlib.metadata as m; assert m.version('lume-base') == '0.5.0'"
+      - name: List Python package versions
+        run: uv pip list
+      - name: Run tests
+        # Run from outside the checkout, as the other legs do, so the tests
+        # import the installed distribution.
+        working-directory: ${{ runner.temp }}
+        run: |
+          uv run --project ${{ github.workspace }} --no-sync pytest --pyargs lume_pva_apg.tests
+
   sdist-round-trip:
     # Every other leg installs from the checkout, where every file of the
     # project is present whether or not the packaging ships it. A file left out
