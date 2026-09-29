@@ -49,6 +49,7 @@ from typing import Any
 import pytest
 
 from lume_pva_apg.tests._requires import skip_if_absent
+from lume_pva_apg.tests._spawn import wait_until_ready
 
 # Keep all EPICS traffic on the loopback interface. Must be set before p4p,
 # pyepics, or the pcaspy server (created in Runner.__init__) initialise.
@@ -68,6 +69,17 @@ try:
     from p4p.client.thread import Context
 
     from lume_pva_apg.runner import Runner
+    from lume_pva_apg.tests._mixed_model import (
+        MIXED_BOOL,
+        MIXED_DEFAULTS,
+        MIXED_ENUM,
+        MIXED_ENUM_OPTIONS,
+        MIXED_FLOAT_IN,
+        MIXED_FLOAT_OUT,
+        MIXED_INT,
+        MIXED_STR,
+        MixedModel,
+    )
 except ImportError as exc:
     skip_if_absent(exc)
 
@@ -170,18 +182,101 @@ class PolicyModel(LUMEModel):
         self.started.set()
 
 
-def _serve(tag: str, overrides: dict[str, Any], started: mpEvent, ready: mpEvent) -> None:
-    """Child-process entry point: serve a PolicyModel with `overrides` applied.
+# The models a server can be started with, each built as ``cls(tag=, started=)``.
+_MODELS: dict[str, Callable[..., LUMEModel]] = {
+    "policy": PolicyModel,
+    "mixed": MixedModel,
+}
+
+
+def _apply_overrides(config: dict[str, Any], overrides: dict[str, Any], tag: str) -> None:
+    """Merge `overrides` into a generated config.
+
+    Every key replaces the config's own, except ``variables``: that one maps a
+    *base* variable name -- tagged here, as the model tags it -- to the keys to
+    merge into that variable's generated entry, so a test can change one
+    variable's ``pv`` or ``mode`` without restating the rest of the config. A
+    name the model does not serve is an error rather than a new entry, so a
+    typo cannot pass as an override that did nothing.
+    """
+    overrides = dict(overrides)
+    for name, entry in overrides.pop("variables", {}).items():
+        key = _tagged(name, tag)
+        if key not in config["variables"]:
+            raise KeyError(f"override names {name!r}, which the model does not serve")
+        config["variables"][key].update(entry)
+    config.update(overrides)
+
+
+class _UdfRunner(Runner):
+    """A runner whose cycles never re-post an undefined variable.
+
+    The stock output step re-posts every variable after each cycle, and for a
+    name in ``_udf`` that re-post carries (INVALID_ALARM, UDF_STATUS) on its
+    own. Leaving those names out of the post-cycle read makes a put's echo the
+    only thing that can write them, so a test sees what the echo does to the
+    stored alarm and nothing else.
+    """
+
+    def _cycle_output_names(self) -> list[str]:
+        return [name for name in super()._cycle_output_names() if name not in self._udf]
+
+
+class _SilentRunner(Runner):
+    """A runner whose output step publishes nothing and never calls super.
+
+    A consumer that takes over publishing entirely still has to complete the
+    puts its clients make, and put completion must not depend on state that
+    only the stock output step sets up.
+    """
+
+    def _post_outputs(self, out_values: dict[str, Any], ts: float) -> None:
+        pass
+
+
+# The runners a server can be started with. A `udf` server swaps the stock
+# runner for :class:`_UdfRunner`.
+_RUNNERS: dict[str, type[Runner]] = {
+    "stock": Runner,
+    "silent": _SilentRunner,
+}
+
+
+def _serve(
+    tag: str,
+    overrides: dict[str, Any],
+    started: mpEvent,
+    ready: mpEvent,
+    model_key: str = "policy",
+    udf: tuple[str, ...] = (),
+    runner_key: str = "stock",
+) -> None:
+    """Child-process entry point: serve the keyed model with `overrides` applied.
+
+    `udf` names base variables to mark undefined once the server is up: each is
+    re-posted through ``_generate_value`` so its stored alarm is
+    (INVALID_ALARM, UDF_STATUS), and the runner's cycles leave it alone (see
+    :class:`_UdfRunner`).
 
     Must be importable at module top level so the ``spawn`` start method can
     locate it. Blocks forever once ready; the parent terminates the process.
     """
-    model = PolicyModel(tag, started)
+    model = _MODELS[model_key](tag=tag, started=started)
     config = Runner.generate_config(model)
     config["update_rate"] = 0.0
-    config.update(overrides)
+    _apply_overrides(config, overrides, tag)
 
-    runner = Runner(model=model, config=config)
+    runner_cls = _RUNNERS[runner_key]
+    if udf and runner_cls is Runner:
+        runner_cls = _UdfRunner
+    runner = runner_cls(model=model, config=config)
+    if udf:
+        # Before the update thread starts, so no cycle can race the post.
+        names = [_tagged(name, tag) for name in udf]
+        runner._udf = frozenset(names)
+        current = model.get(names)
+        for name in names:
+            runner.pvs[name].post(runner._generate_value(name, current[name]))
     threading.Thread(target=runner._run, daemon=True).start()
 
     # Runner.__init__ enqueues an empty update; wait for that cycle to land so
@@ -198,17 +293,34 @@ def serve() -> Generator[Callable[..., Callable[[str], str]], None, None]:
 
     The factory returns the name mapper for that server: it turns a base
     variable name into the PV this particular test's runner serves it as.
+
+    ``serve(model="policy", udf=(), runner="stock", **overrides)``: `model`
+    picks the served model from ``_MODELS``; `udf` names base variables served
+    undefined (see :func:`_serve`); `runner` picks the runner class from
+    ``_RUNNERS``; keyword overrides replace config keys, and
+    ``variables={base_name: {...}}`` is merged into each named variable's
+    generated entry (see :func:`_apply_overrides`).
     """
     procs: list[Any] = []
 
-    def _start(**overrides: Any) -> Callable[[str], str]:
+    def _start(
+        *,
+        model: str = "policy",
+        udf: tuple[str, ...] = (),
+        runner: str = "stock",
+        **overrides: Any,
+    ) -> Callable[[str], str]:
         tag = f"_wp{next(_TAGS)}"
         started = _MP.Event()
         ready = _MP.Event()
-        proc = _MP.Process(target=_serve, args=(tag, overrides, started, ready), daemon=True)
+        proc = _MP.Process(
+            target=_serve,
+            args=(tag, overrides, started, ready, model, tuple(udf), runner),
+            daemon=True,
+        )
         proc.start()
         procs.append(proc)
-        assert ready.wait(timeout=OP_TIMEOUT), "child Runner never became ready"
+        wait_until_ready(proc, ready)
         return lambda name: _tagged(name, tag)
 
     try:
@@ -376,6 +488,111 @@ def test_pva_echo_stands_on_refusal_by_default(serve) -> None:
 
         assert float(ctx.get(p("sum_output"), timeout=OP_TIMEOUT)) == pytest.approx(8.4)
         assert float(ctx.get(p("input_a"), timeout=OP_TIMEOUT)) == pytest.approx(REFUSED)
+
+
+@pytest.mark.parametrize("echo_unconfirmed", [True, False], ids=["echo-now", "echo-confirmed"])
+def test_a_pva_put_carrying_alarm_fields_leaves_a_standing_udf_alarm(
+    serve, echo_unconfirmed: bool
+) -> None:
+    """The alarm is the server's: a put that sends ``alarm.severity`` along with
+    its value takes the value, and the stored (INVALID_ALARM, UDF_STATUS) pair
+    stands through either echo."""
+    p = serve(udf=("input_a",), echo_unconfirmed_writes=echo_unconfirmed)
+
+    with Context("pva") as ctx:
+        before = ctx.get(p("input_a"), timeout=OP_TIMEOUT).raw
+        assert (before["alarm"]["severity"], before["alarm"]["status"]) == (3, 6)
+
+        ctx.put(p("input_a"), {"value": 4.2, "alarm.severity": 0}, timeout=OP_TIMEOUT, wait=True)
+
+        after = ctx.get(p("input_a"), timeout=OP_TIMEOUT).raw
+        assert after["value"] == pytest.approx(4.2)
+        assert (after["alarm"]["severity"], after["alarm"]["status"]) == (3, 6)
+        assert float(ctx.get(p("sum_output"), timeout=OP_TIMEOUT)) == pytest.approx(8.4)
+
+
+# --------------------------------------------------------------------------
+# (a') the CA put echo may not clear a standing UDF alarm
+# --------------------------------------------------------------------------
+# The udf servers seed the undefined state on PVA only, and their cycles never
+# write input_a, so its CA alarm is whatever pcaspy starts a parameter with
+# until the first setParam. The tests therefore make an accepted put first
+# wherever the UDF status they read afterwards must be the put completion's.
+
+_CA_UDF = (pcaspy.Severity.INVALID_ALARM, pcaspy.Alarm.UDF_ALARM)
+_CA_REFUSED = (pcaspy.Severity.INVALID_ALARM, pcaspy.Alarm.WRITE_ALARM)
+
+
+def test_a_ca_put_on_an_undefined_variable_leaves_it_undefined(serve) -> None:
+    p = serve(udf=("input_a",))
+
+    _put(p("input_a"), 4.2)
+
+    assert _read(p("input_a")) == pytest.approx(4.2)
+    assert _read(p("sum_output")) == pytest.approx(8.4)
+    assert _severity(p("input_a")) == _CA_UDF
+
+
+@pytest.mark.parametrize("echo_unconfirmed", [True, False], ids=["echo-now", "echo-confirmed"])
+def test_a_refused_ca_put_on_an_undefined_variable_reads_as_refused(
+    serve, echo_unconfirmed: bool
+) -> None:
+    """The refusal alarm is written after the UDF status, so it is the one a
+    client reads."""
+    p = serve(
+        udf=("input_a",),
+        echo_unconfirmed_writes=echo_unconfirmed,
+        alarm_on_refused_write=True,
+    )
+
+    _put(p("input_a"), REFUSED)
+
+    assert _severity(p("input_a")) == _CA_REFUSED
+
+
+def test_a_withheld_echo_still_publishes_the_udf_alarm(serve) -> None:
+    p = serve(udf=("input_a",), echo_unconfirmed_writes=False)
+
+    _put(p("input_a"), 4.2)
+
+    with _monitored(p("input_a")) as monitored:
+        _put(p("input_a"), REFUSED)
+
+        # The value the model never took stays off the PV...
+        assert _read(p("input_a")) == pytest.approx(4.2)
+        assert monitored.value == pytest.approx(4.2)
+        # ...while the UDF status was flushed to the monitor with it.
+        assert (monitored.severity, monitored.status) == _CA_UDF
+    assert _severity(p("input_a")) == _CA_UDF
+
+
+def test_a_refused_echo_after_a_failed_cycle_keeps_a_standing_udf(serve) -> None:
+    p = serve(udf=("input_a",))
+
+    _put(p("input_a"), 4.2)
+    assert _severity(p("input_a")) == _CA_UDF
+
+    # The refused value is echoed, but the model rejected it and the cycle
+    # failed: nothing about that makes the variable defined.
+    _put(p("input_a"), REFUSED)
+    # The echo above is recorded but not flushed; the next cycle's flush is
+    # what carries it -- and the alarm stored with it -- to the wire.
+    _put(p("input_b"), 1.0)
+
+    assert _read(p("input_a")) == pytest.approx(REFUSED)
+    assert _severity(p("input_a")) == _CA_UDF
+
+
+def test_a_runner_publishing_nothing_still_completes_a_ca_put(serve) -> None:
+    p = serve(runner="silent")
+
+    _put(p("input_a"), 4.2)
+
+    # The put's own echo landed; the output step, which this runner replaced
+    # with nothing, never published the model's readback.
+    assert _read(p("input_a")) == pytest.approx(4.2)
+    assert _read(p("sum_output")) == pytest.approx(0.0)
+    assert _severity(p("input_a")) == (0, 0)
 
 
 # --------------------------------------------------------------------------
@@ -563,6 +780,10 @@ def _driver_stub(**policy: Any) -> tuple[_RecordingDriver, list]:
     runner.echo_unconfirmed_writes = policy.get("echo_unconfirmed_writes", True)
     runner.alarm_on_refused_write = policy.get("alarm_on_refused_write", False)
     runner.clamp_writes = policy.get("clamp_writes", False)
+    if "udf" in policy:
+        # Otherwise left to the class default, as for a runner whose output
+        # step never ran.
+        runner._udf = frozenset(policy["udf"])
 
     completions: list = []
     runner._enqueue = lambda values, done=None, reset=False: completions.append(done)
@@ -658,3 +879,94 @@ def test_accepted_write_raises_no_alarm_even_with_alarms_enabled() -> None:
         ("updatePV", "input_a"),
         ("callbackPV", "input_a"),
     ]
+
+
+def test_an_undefined_variable_restates_udf_after_the_echo() -> None:
+    driver, completions = _driver_stub(udf=(INPUT_A,))
+
+    driver.write("input_a", 4.2)
+    completions[0](None)
+
+    assert driver.calls == [
+        ("setParam", "input_a", 4.2),
+        ("setParamStatus", "input_a", pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM),
+        ("updatePV", "input_a"),
+        ("callbackPV", "input_a"),
+    ]
+
+
+def test_a_refusal_alarm_is_written_after_the_udf_status() -> None:
+    driver, completions = _driver_stub(udf=(INPUT_A,), alarm_on_refused_write=True)
+
+    driver.write("input_a", REFUSED)
+    completions[0]("model refused it")
+
+    assert driver.calls == [
+        ("setParam", "input_a", REFUSED),
+        ("setParamStatus", "input_a", pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM),
+        ("setParamStatus", "input_a", pcaspy.Alarm.WRITE_ALARM, pcaspy.Severity.INVALID_ALARM),
+        ("updatePV", "input_a"),
+        ("callbackPV", "input_a"),
+    ]
+
+
+def test_a_withheld_echo_still_restates_udf() -> None:
+    driver, completions = _driver_stub(udf=(INPUT_A,), echo_unconfirmed_writes=False)
+
+    driver.write("input_a", REFUSED)
+    completions[0]("model refused it")
+
+    assert driver.calls == [
+        ("setParamStatus", "input_a", pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM),
+        ("updatePV", "input_a"),
+        ("callbackPV", "input_a"),
+    ]
+
+
+# --------------------------------------------------------------------------
+# harness: a mixed-type model, and per-variable config overrides
+# --------------------------------------------------------------------------
+
+
+def test_mixed_model_serves_every_type(serve) -> None:
+    """Float, int, bool, str and enum each reach a CA and a PVA client."""
+    p = serve(model="mixed")
+
+    assert _read(p(MIXED_FLOAT_IN)) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+    assert _read(p(MIXED_FLOAT_OUT)) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+    assert _read(p(MIXED_INT)) == MIXED_DEFAULTS[MIXED_INT]
+    assert _read(p(MIXED_BOOL)) == 1
+    str_value = epics.caget(p(MIXED_STR), as_string=True, use_monitor=False, timeout=OP_TIMEOUT)
+    assert str_value == MIXED_DEFAULTS[MIXED_STR]
+    enum_index = MIXED_ENUM_OPTIONS.index(MIXED_DEFAULTS[MIXED_ENUM])
+    assert _read(p(MIXED_ENUM)) == enum_index
+
+    with Context("pva") as ctx:
+
+        def raw(name: str) -> Any:
+            return ctx.get(p(name), timeout=OP_TIMEOUT).raw.value
+
+        assert raw(MIXED_FLOAT_IN) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+        assert raw(MIXED_FLOAT_OUT) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+        assert raw(MIXED_INT) == MIXED_DEFAULTS[MIXED_INT]
+        assert raw(MIXED_BOOL) is True
+        assert raw(MIXED_STR) == MIXED_DEFAULTS[MIXED_STR]
+        assert list(raw(MIXED_ENUM).choices) == MIXED_ENUM_OPTIONS
+        assert raw(MIXED_ENUM).index == enum_index
+
+
+def test_variable_override_reaches_the_config(serve) -> None:
+    """``variables={name: {...}}`` changes that variable's entry and no other.
+
+    ``mode`` is honoured by the PVA handler, so an input overridden to ``ro``
+    refuses a PVA put while its unmodified neighbour still accepts one.
+    """
+    p = serve(variables={"input_a": {"mode": "ro"}})
+
+    with Context("pva") as ctx:
+        with pytest.raises(Exception, match="Read only PV"):
+            ctx.put(p("input_a"), 1.0, timeout=OP_TIMEOUT, wait=True)
+        ctx.put(p("input_b"), 2.0, timeout=OP_TIMEOUT, wait=True)
+
+        assert float(ctx.get(p("input_a"), timeout=OP_TIMEOUT)) == pytest.approx(0.0)
+        assert float(ctx.get(p("input_b"), timeout=OP_TIMEOUT)) == pytest.approx(2.0)

@@ -32,6 +32,8 @@ objects that are still alive, which pyepics documents as a route to a random
 SIGSEGV from inside the EPICS libraries.
 """
 
+import functools
+import inspect
 import itertools
 import multiprocessing
 import os
@@ -43,6 +45,7 @@ from typing import Any
 import pytest
 
 from lume_pva_apg.tests._requires import skip_if_absent
+from lume_pva_apg.tests._spawn import wait_until_ready
 
 # Keep all EPICS traffic on the loopback interface. Must be set before p4p,
 # pyepics, or the pcaspy server (created in Runner.__init__) initialise.
@@ -56,12 +59,28 @@ os.environ.setdefault("EPICS_PVA_AUTO_ADDR_LIST", "NO")
 # rather than failing collection, which would take the whole suite with it.
 try:
     import epics
+    import pcaspy
     from lume.model import LUMEModel
     from lume.variables import ScalarVariable
     from p4p.client.thread import Context
     from p4p.client.thread import TimeoutError as PvaTimeoutError
 
     from lume_pva_apg.runner import RESET_CONTROL_PV, Runner
+    from lume_pva_apg.tests._mixed_model import (
+        FAIL_MALFORMED,
+        FAIL_RAISE,
+        FAIL_UDF,
+        MIXED_BOOL,
+        MIXED_DEFAULTS,
+        MIXED_ENUM,
+        MIXED_ENUM_OPTIONS,
+        MIXED_FLOAT_IN,
+        MIXED_FLOAT_OUT,
+        MIXED_INT,
+        MIXED_SEVERITY_TRIGGER,
+        MIXED_STR,
+        MixedModel,
+    )
 except ImportError as exc:
     skip_if_absent(exc)
 
@@ -173,11 +192,74 @@ class SeamRunner(ExtendOnlyRunner):
         super()._post_outputs(out_values, ts)
 
 
+# The variable PvaOnlyVariableRunner keeps off CA.
+PVA_ONLY = OUT_DOUBLE
+
+
+class PvaOnlyVariableRunner(Runner):
+    """Serves one variable over PVA only, by clearing ``supports_ca`` around it.
+
+    A consumer that must leave one name to another CA server keeps that name
+    off its own CA database this way, without giving up CA for the rest. The
+    flag is restored in a ``finally``, so everything read after ``_add_pv`` --
+    the other variables, the pvdb merge, the control PVs -- still sees CA on.
+    """
+
+    def _add_pv(self, pv: str, var: Any, ro: bool, prefix: str, handler: Any) -> None:
+        if var.name != PVA_ONLY:
+            super()._add_pv(pv, var, ro, prefix, handler)
+            return
+        supports_ca = self.supports_ca
+        self.supports_ca = False
+        try:
+            super()._add_pv(pv, var, ro, prefix, handler)
+        finally:
+            self.supports_ca = supports_ca
+
+
 _RUNNERS: dict[str, type[Runner]] = {
     "stock": Runner,
     "extend_only": ExtendOnlyRunner,
     "seam": SeamRunner,
+    "pva_only_variable": PvaOnlyVariableRunner,
+    # The stock runner, serving a MixedModel instead of a SeamModel.
+    "mixed": Runner,
+    # The stock runner, serving a MixedModel with output_severity / extra-key knobs.
+    "mixed_udf": Runner,
+    "mixed_udf_int": Runner,
+    "mixed_raise": Runner,
+    "mixed_malformed": Runner,
+    "mixed_extra": Runner,
+    "mixed_udf_extra": Runner,
 }
+
+# The model each runner key serves, where it is not SeamModel.
+_MODELS: dict[str, Callable[[mpEvent], LUMEModel]] = {
+    "mixed": MixedModel,
+    "mixed_udf": functools.partial(MixedModel, fail_mode=FAIL_UDF),
+    "mixed_udf_int": functools.partial(MixedModel, fail_mode=FAIL_UDF, udf_names=(MIXED_INT,)),
+    "mixed_raise": functools.partial(MixedModel, fail_mode=FAIL_RAISE),
+    "mixed_malformed": functools.partial(MixedModel, fail_mode=FAIL_MALFORMED),
+    "mixed_extra": functools.partial(MixedModel, extra_key=True),
+    "mixed_udf_extra": functools.partial(MixedModel, fail_mode=FAIL_UDF, extra_key=True),
+}
+
+
+def _apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """Merge `overrides` into a generated config.
+
+    Every key replaces the config's own, except ``variables``: that one maps a
+    variable name to the keys to merge into *that variable's* generated entry,
+    so a test can change one variable's ``pv`` or ``mode`` without restating
+    the rest of the config. A name the model does not serve is an error rather
+    than a new entry, so a typo cannot pass as an override that did nothing.
+    """
+    overrides = dict(overrides)
+    for name, entry in overrides.pop("variables", {}).items():
+        if name not in config["variables"]:
+            raise KeyError(f"override names {name!r}, which the model does not serve")
+        config["variables"][name].update(entry)
+    config.update(overrides)
 
 
 def _serve(
@@ -187,15 +269,16 @@ def _serve(
     started: mpEvent,
     ready: mpEvent,
 ) -> None:
-    """Child-process entry point: serve a SeamModel under `prefix`.
+    """Child-process entry point: serve the key's model under `prefix`.
 
+    The model is SeamModel unless ``_MODELS`` names another for `runner_key`.
     Must be importable at module top level so the ``spawn`` start method can
     locate it. Blocks forever once ready; the parent terminates the process.
     """
-    model = SeamModel(started)
+    model = _MODELS.get(runner_key, SeamModel)(started)
     config = Runner.generate_config(model, prefix=prefix)
     config["update_rate"] = 0.0
-    config.update(overrides)
+    _apply_overrides(config, overrides)
 
     runner = _RUNNERS[runner_key](model=model, config=config)
     threading.Thread(target=runner._run, daemon=True).start()
@@ -210,7 +293,12 @@ def _serve(
 
 @pytest.fixture(scope="function")
 def serve() -> Generator[Callable[..., str], None, None]:
-    """Yield a factory that starts a configured Runner and returns its prefix."""
+    """Yield a factory that starts a configured Runner and returns its prefix.
+
+    ``serve(runner_key, **overrides)``: keyword overrides replace config keys,
+    and ``variables={name: {...}}`` is merged into each named variable's
+    generated entry (see :func:`_apply_overrides`).
+    """
     procs: list[Any] = []
 
     def _start(runner_key: str = "stock", **overrides: Any) -> str:
@@ -222,7 +310,7 @@ def serve() -> Generator[Callable[..., str], None, None]:
         )
         proc.start()
         procs.append(proc)
-        assert ready.wait(timeout=OP_TIMEOUT), "child Runner never became ready"
+        wait_until_ready(proc, ready)
         return prefix
 
     try:
@@ -510,3 +598,262 @@ def test_control_pvs_false_leaves_the_write_path_working(serve) -> None:
 
     assert _read(f"{prefix}{IN_A}") == pytest.approx(1.5)
     assert _read(f"{prefix}{OUT_DOUBLE}") == pytest.approx(3.0)
+
+
+# --------------------------------------------------------------------------
+# harness: a mixed-type model, and per-variable config overrides
+# --------------------------------------------------------------------------
+
+
+def test_mixed_model_serves_every_type_over_ca(serve) -> None:
+    """Float, int, bool, str and enum each reach a CA client with their value."""
+    prefix = serve("mixed")
+
+    assert _read(f"{prefix}{MIXED_FLOAT_IN}") == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+    assert _read(f"{prefix}{MIXED_INT}") == MIXED_DEFAULTS[MIXED_INT]
+    assert _read(f"{prefix}{MIXED_BOOL}") == 1
+    str_value = epics.caget(
+        f"{prefix}{MIXED_STR}", as_string=True, use_monitor=False, timeout=OP_TIMEOUT
+    )
+    assert str_value == MIXED_DEFAULTS[MIXED_STR]
+    assert _read(f"{prefix}{MIXED_ENUM}") == MIXED_ENUM_OPTIONS.index(MIXED_DEFAULTS[MIXED_ENUM])
+
+    ctrl = _ctrlvars(f"{prefix}{MIXED_ENUM}")
+    assert list(ctrl["enum_strs"]) == MIXED_ENUM_OPTIONS
+
+
+def test_mixed_model_serves_every_type_over_pva(serve) -> None:
+    """The same five types reach a PVA client, each as its own normative type."""
+    prefix = serve("mixed")
+
+    with Context("pva") as ctx:
+
+        def raw(name: str) -> Any:
+            return ctx.get(f"{prefix}{name}", timeout=OP_TIMEOUT).raw.value
+
+        assert raw(MIXED_FLOAT_IN) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+        assert raw(MIXED_FLOAT_OUT) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+        assert raw(MIXED_INT) == MIXED_DEFAULTS[MIXED_INT]
+        assert raw(MIXED_BOOL) is True
+        assert raw(MIXED_STR) == MIXED_DEFAULTS[MIXED_STR]
+        enum = raw(MIXED_ENUM)
+        assert list(enum.choices) == MIXED_ENUM_OPTIONS
+        assert enum.index == MIXED_ENUM_OPTIONS.index(MIXED_DEFAULTS[MIXED_ENUM])
+
+
+def test_variable_override_reaches_the_config(serve) -> None:
+    """``variables={name: {...}}`` changes that variable's entry and no other.
+
+    Renaming the PV is observable from outside: the variable is served under
+    the new name, no longer under its own, and its neighbour is untouched.
+    """
+    prefix = serve(variables={IN_A: {"pv": "RENAMED"}})
+
+    assert _read(f"{prefix}RENAMED") == pytest.approx(0.0)
+    _absent(f"{prefix}{IN_A}")
+    _read(f"{prefix}{OUT_DOUBLE}")
+
+
+# --------------------------------------------------------------------------
+# display metadata: a configured precision and description reach the wire
+# --------------------------------------------------------------------------
+
+
+def _pva_raw(prefix: str, name: str) -> Any:
+    """Read a PVA PV's whole structure, metadata included."""
+    with Context("pva") as ctx:
+        return ctx.get(f"{prefix}{name}", timeout=OP_TIMEOUT).raw
+
+
+def test_a_configured_precision_reaches_ca_as_dbr_ctrl_precision(serve) -> None:
+    """``precision: 3`` on a float is the ``precision`` a CA client's DBR_CTRL read reports."""
+    prefix = serve("mixed", variables={MIXED_FLOAT_IN: {"precision": 3}})
+
+    assert _ctrlvars(f"{prefix}{MIXED_FLOAT_IN}")["precision"] == 3
+
+
+def test_a_configured_precision_reaches_pva_as_display_precision(serve) -> None:
+    """``precision: 3`` on a float is served as ``display.precision``; a float
+    configured without one keeps its precision-less display block."""
+    prefix = serve("mixed", variables={MIXED_FLOAT_IN: {"precision": 3}})
+
+    configured = _pva_raw(prefix, MIXED_FLOAT_IN)
+    assert configured["display"]["precision"] == 3
+    assert configured["value"] == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+
+    plain = _pva_raw(prefix, MIXED_FLOAT_OUT)
+    assert "precision" not in plain["display"].keys()
+
+
+@pytest.mark.parametrize(
+    "var_name",
+    [
+        pytest.param(MIXED_FLOAT_IN, id="float"),
+        pytest.param(MIXED_INT, id="int"),
+        pytest.param(MIXED_BOOL, id="bool"),
+        pytest.param(MIXED_STR, id="str"),
+        pytest.param(MIXED_ENUM, id="enum"),
+    ],
+)
+def test_a_configured_description_reaches_pva_as_display_description(serve, var_name: str) -> None:
+    """``description: "x"`` is served as ``display.description`` on every
+    PVA type with a display block, and only on the variable configured with it."""
+    prefix = serve("mixed", variables={var_name: {"description": "x"}})
+
+    assert _pva_raw(prefix, var_name)["display"]["description"] == "x"
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["display"]["description"] == ""
+
+
+def test_precision_and_description_leave_add_pv_signature_unchanged() -> None:
+    """Subclasses call and override ``_add_pv``; the metadata travels through
+    ``_pv_meta`` rather than new parameters, so its signature is 0.1.4's."""
+    params = list(inspect.signature(Runner._add_pv).parameters)
+    assert params == ["self", "pv", "var", "ro", "prefix", "handler"]
+
+
+# --------------------------------------------------------------------------
+# output_severity: an undefined output reaches both transports as INVALID/UDF
+# --------------------------------------------------------------------------
+
+# What a CA client reads for an undefined output: INVALID severity, UDF status.
+CA_UDF = (int(pcaspy.Severity.INVALID_ALARM), int(pcaspy.Alarm.UDF_ALARM))
+# The same on PVA: epicsAlarmSeverity INVALID_ALARM, epicsAlarmStatus UDF_STATUS.
+PVA_UDF = (3, 6)
+
+
+def _pva_alarm(prefix: str, name: str) -> tuple[int, int]:
+    raw = _pva_raw(prefix, name)
+    return raw["alarm"]["severity"], raw["alarm"]["status"]
+
+
+def test_severity_udf_outputs_reach_ca_and_pva_as_invalid_udf(serve) -> None:
+    prefix = serve("mixed_udf")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        assert _severity(f"{prefix}{name}") == CA_UDF, name
+        assert _pva_alarm(prefix, name) == PVA_UDF, name
+    # an undefined name still carries its type-valid value
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(2 * MIXED_SEVERITY_TRIGGER)
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["value"] == pytest.approx(2 * MIXED_SEVERITY_TRIGGER)
+    # a name the hook did not report is untouched
+    assert _severity(f"{prefix}{MIXED_BOOL}") == (0, 0)
+    assert _pva_alarm(prefix, MIXED_BOOL) == (0, 0)
+
+
+def test_severity_recovered_udf_outputs_leave_invalid_on_both_transports(serve) -> None:
+    prefix = serve("mixed_udf")
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+    assert _severity(f"{prefix}{MIXED_INT}") == CA_UDF
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 2.0)
+
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        assert _severity(f"{prefix}{name}") == (0, 0), name
+        assert _pva_alarm(prefix, name) == (0, 0), name
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(4.0)
+
+
+def test_severity_a_name_absent_from_the_reply_keeps_0_1_4_alarms(serve) -> None:
+    """Only the int is reported: the float output, outside its range, keeps the
+    PVA range rule (MAJOR) and CA's no-alarm-threshold behaviour."""
+    prefix = serve("mixed_udf_int")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    assert _severity(f"{prefix}{MIXED_INT}") == CA_UDF
+    assert _pva_alarm(prefix, MIXED_INT) == PVA_UDF
+    assert _pva_alarm(prefix, MIXED_FLOAT_OUT) == (2, 2)
+    assert _severity(f"{prefix}{MIXED_FLOAT_OUT}") == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "runner_key",
+    [
+        pytest.param("mixed_raise", id="hook-raises"),
+        pytest.param("mixed_malformed", id="unknown-condition"),
+    ],
+)
+def test_severity_a_failing_hook_posts_nothing_on_either_transport(serve, runner_key: str) -> None:
+    prefix = serve(runner_key)
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 2.0)
+    before = _pva_raw(prefix, MIXED_FLOAT_OUT)
+    assert before["value"] == pytest.approx(4.0)
+
+    # The cycle fails; the put still completes, with the error.
+    epics.caput(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER, wait=True, timeout=OP_TIMEOUT)
+
+    after = _pva_raw(prefix, MIXED_FLOAT_OUT)
+    assert after["value"] == pytest.approx(4.0)
+    assert after["timeStamp"]["secondsPastEpoch"] == before["timeStamp"]["secondsPastEpoch"]
+    assert after["timeStamp"]["nanoseconds"] == before["timeStamp"]["nanoseconds"]
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(4.0)
+    assert _severity(f"{prefix}{MIXED_INT}") == (0, 0)
+
+    # ...and the next good cycle publishes as usual.
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 1.0)
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(2.0)
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["value"] == pytest.approx(2.0)
+
+
+def test_severity_hookless_model_with_an_extra_key_serves_as_0_1_4(serve) -> None:
+    """No hook: an extra, wrongly typed key from ``_get`` changes nothing, and
+    no name is ever reported undefined."""
+    prefix = serve("mixed_extra")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 2.0)
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(4.0)
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["value"] == pytest.approx(4.0)
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+    assert _pva_alarm(prefix, MIXED_FLOAT_OUT) == (2, 2)
+    assert _severity(f"{prefix}{MIXED_FLOAT_OUT}") == (0, 0)
+    assert _severity(f"{prefix}{MIXED_INT}") == (0, 0)
+    assert _pva_alarm(prefix, MIXED_INT) == (0, 0)
+
+
+def test_severity_an_extra_key_does_not_disturb_the_udf_hook(serve) -> None:
+    prefix = serve("mixed_udf_extra")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    assert _severity(f"{prefix}{MIXED_INT}") == CA_UDF
+    assert _pva_alarm(prefix, MIXED_INT) == PVA_UDF
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(2 * MIXED_SEVERITY_TRIGGER)
+
+
+def test_severity_a_pva_put_to_a_udf_name_keeps_invalid_udf(serve) -> None:
+    prefix = serve("mixed_udf")
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    with Context("pva") as ctx:
+        ctx.put(f"{prefix}{MIXED_INT}", 7, timeout=OP_TIMEOUT, wait=True)
+
+    raw = _pva_raw(prefix, MIXED_INT)
+    assert raw["value"] == 7
+    assert (raw["alarm"]["severity"], raw["alarm"]["status"]) == PVA_UDF
+
+
+# --------------------------------------------------------------------------
+# supports_ca cleared around _add_pv keeps one variable off CA
+# --------------------------------------------------------------------------
+
+
+def test_supports_ca_cleared_serves_pva_only(serve) -> None:
+    """The variable added with ``supports_ca`` cleared is PVA-only; the rest keep CA."""
+    prefix = serve("pva_only_variable")
+
+    with Context("pva") as ctx:
+        assert ctx.get(f"{prefix}{PVA_ONLY}", timeout=OP_TIMEOUT) is not None
+        assert ctx.get(f"{prefix}{IN_A}", timeout=OP_TIMEOUT) is not None
+
+    _absent(f"{prefix}{PVA_ONLY}")
+    assert _read(f"{prefix}{IN_A}") == pytest.approx(0.0)
+    assert _read(f"{prefix}{RESET_CONTROL_PV}") == 0
+
+    # The output pass skips the name CA does not serve and still publishes it
+    # over PVA.
+    _put(f"{prefix}{IN_A}", 1.5)
+    assert _pva_raw(prefix, PVA_ONLY)["value"] == pytest.approx(3.0)

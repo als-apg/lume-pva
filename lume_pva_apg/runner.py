@@ -7,10 +7,11 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from queue import Empty, Queue
-from typing import Any, TypedDict
+from types import MappingProxyType
+from typing import Any, NotRequired, TypedDict
 
 from lume.model import LUMEModel, Variable
-from lume.variables import ParticleGroupVariable
+from lume.variables import IntVariable, ParticleGroupVariable
 
 from lume_pva_apg._optional import missing_extra
 
@@ -29,7 +30,14 @@ try:
 except ImportError as exc:
     raise missing_extra("pcaspy", "ca", exc) from exc
 
-from lume_pva_apg.variables import VariableHandler, find_variable_handler
+from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
+from lume_pva_apg.variables import (
+    EnumVariableHandler,
+    ScalarVariableHandler,
+    SimpleScalarHandler,
+    VariableHandler,
+    find_variable_handler,
+)
 
 try:
     from ._version import version as lume_pva_version
@@ -60,11 +68,115 @@ class RunnerVariable(TypedDict):
         - 'ro': Read-only PV served by this server
         - 'rw': Read-write PV served by this server. Errors if Variable.read_only
         Default is 'rw'
+    precision : int, optional
+        Number of digits after the decimal point a display client shows. An int
+        in 0..17 (the significant digits a double carries), allowed only on a
+        float ``ScalarVariable``.
+    description : str, optional
+        Text served as the PV's description. Overrides the variable's own
+        ``description`` (lume-base 0.6); ``""`` means none. Rejected on array
+        and Torch variables, whose PVs carry no display block.
     """
 
     name: str
     pv: str
     mode: str
+    precision: NotRequired[int]
+    description: NotRequired[str]
+
+
+# Upper bound on a configured precision: the significant decimal digits an
+# IEEE double carries. A policy bound -- CA's dbr_short field would take more,
+# but no digit past the 17th means anything.
+MAX_PRECISION = 17
+
+# Handlers whose PVA type carries a display block, and so can serve a
+# description. Compared by exact type: TorchScalarVariableHandler and
+# NDVariableHandler are deliberately absent.
+_DESCRIBED_HANDLERS = (ScalarVariableHandler, SimpleScalarHandler, EnumVariableHandler)
+
+# Conditions a model's output_severity hook may report, each mapped to the
+# alarm it raises: the PVA (severity, status) pair and the CA (alarm, severity)
+# pair handed to pcaspy's setParamStatus.
+_CONDITIONS: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
+    "udf": (
+        (int(epicsAlarmSeverity.INVALID_ALARM), int(epicsAlarmStatus.UDF_STATUS)),
+        (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM),
+    ),
+}
+# The alarm an undefined output carries on each transport.
+_UDF_PVA, _UDF_CA = _CONDITIONS["udf"]
+
+
+def _resolve_pv_meta(
+    name: str,
+    entry: RunnerVariable | dict,
+    variable: Variable,
+    handler: VariableHandler,
+) -> dict[str, Any]:
+    """Validate a config entry's ``precision`` and ``description``.
+
+    Parameters
+    ----------
+    name : str
+        Variable name, used in error messages.
+    entry : RunnerVariable
+        The variable's config entry. Only read.
+    variable : Variable
+        The model's variable. Only read.
+    handler : VariableHandler
+        The handler resolved for ``variable``; never None.
+
+    Returns
+    -------
+    dict
+        ``{"precision": int | None, "description": str | None}``. A
+        description of ``""`` -- configured or from the variable -- is None.
+
+    Raises
+    ------
+    ValueError
+        A key is malformed or not allowed on this variable's type.
+    """
+    handler_type = type(handler)
+
+    precision = entry.get("precision")
+    if "precision" in entry:
+        # type() rather than isinstance: bool is an int subclass, and True is
+        # not a precision.
+        if type(precision) is not int or not 0 <= precision <= MAX_PRECISION:
+            raise ValueError(
+                f"Variable {name}: 'precision' must be an int in 0..{MAX_PRECISION}, "
+                f"got {precision!r}"
+            )
+        # IntVariable shares ScalarVariableHandler but is served as an integer
+        # NTScalar, where digits after the decimal point mean nothing.
+        if handler_type is not ScalarVariableHandler or isinstance(variable, IntVariable):
+            raise ValueError(
+                f"Variable {name}: 'precision' is only allowed on a float scalar variable, "
+                f"not {type(variable).__name__}"
+            )
+
+    described = handler_type in _DESCRIBED_HANDLERS
+    if "description" in entry:
+        description = entry["description"]
+        if not isinstance(description, str):
+            raise ValueError(
+                f"Variable {name}: 'description' must be a str, got {type(description).__name__}"
+            )
+        if not described:
+            raise ValueError(
+                f"Variable {name}: 'description' is not supported on {type(variable).__name__}"
+            )
+    elif described:
+        # lume-base 0.6 added Variable.description; older versions lack it.
+        description = getattr(variable, "description", None)
+    else:
+        # A model-side description on an array or Torch variable is ignored,
+        # so a lume-base 0.6 model carrying one still boots.
+        description = None
+
+    return {"precision": precision, "description": description or None}
 
 
 class RunnerConfig(TypedDict):
@@ -105,6 +217,14 @@ class RunnerConfig(TypedDict):
         runner shares its prefix with another server, or when the surrounding
         deployment offers reset through a channel of its own, so the runner
         claims no name the model did not ask for.
+    tick_interval_s : float | None
+        Period in seconds of the runner's own passes: every interval, a pass
+        with no input values is queued, so a model whose outputs move on their
+        own is published without a client write. Absent or None, the default,
+        queues none. At most one such pass is ever waiting in the queue, so a
+        model slower than the interval is never buried under a backlog.
+        Otherwise a finite int or float greater than zero; anything else is
+        rejected with a ValueError.
     """
 
     prefix: str
@@ -115,6 +235,7 @@ class RunnerConfig(TypedDict):
     alarm_on_refused_write: bool
     clamp_writes: bool
     control_pvs: bool
+    tick_interval_s: NotRequired[float | None]
 
 
 class Runner:
@@ -126,6 +247,27 @@ class Runner:
     # List of all output PVs that need to be updated after simulation
     outputs: list[str]
     values: dict[str, Value]
+    # Validated precision/description per served variable name. The class
+    # default lets a Runner built without __init__ read it; __init__ replaces it.
+    _pv_meta: MappingProxyType | dict[str, dict[str, Any]] = MappingProxyType({})
+    # Names whose served value is undefined: _generate_value overlays
+    # (INVALID_ALARM, UDF_STATUS) on them. Immutable, and empty by default so a
+    # Runner built without __init__ publishes exactly as 0.1.4 did.
+    _udf: frozenset[str] = frozenset()
+    # The names this cycle asked ``model.get`` for. ``_post_outputs`` evaluates
+    # severity over these only: ``LUMEModel.get`` validates just the requested
+    # names, so any extra key a model's ``_get`` returned is unvalidated.
+    _cycle_requested_names: tuple[str, ...] = ()
+    # Periodic-pass state (``tick_interval_s``). ``_tick_pending`` is true while
+    # a tick item sits in the queue, so at most one is ever waiting;
+    # ``_pass_is_tick`` tells a subclass the current pass is a pure tick. The
+    # defaults describe a runner with no ticker, so a Runner built without
+    # __init__ behaves as one that never ticks.
+    _tick_interval_s: float | None = None
+    _tick_pending: bool = False
+    _pass_is_tick: bool = False
+    _ticker: threading.Thread | None = None
+    _ticker_stop: threading.Event | None = None
 
     class Handler:
         """
@@ -147,6 +289,14 @@ class Runner:
                 return
 
             value = self.runner._clamp_write(self.variable, op.value())
+            # The alarm is the server's to set, never the client's: a put that
+            # carried alarm fields must not overwrite a standing alarm (such as
+            # an undefined output's INVALID/UDF) through either echo below.
+            # SharedPV.post stores only marked fields, so unmarking them keeps
+            # the stored alarm. Each leaf is unmarked on its own because
+            # unmarking the "alarm" parent leaves the leaves marked.
+            for field in ("alarm.severity", "alarm.status", "alarm.message"):
+                value.mark(field, False)
 
             def _complete(error: str | None) -> None:
                 # The echo is the value the model was given, so it may only be
@@ -220,6 +370,12 @@ class Runner:
                 # request leaves the PV holding a value that never landed.
                 if accepted or self.runner.echo_unconfirmed_writes:
                     self.setParam(reason, value)
+                # setParam recomputes the alarm from the value, which would
+                # clear a standing UDF the model reported on the last cycle.
+                # Restated whether or not setParam ran, and before the refusal
+                # alarm so a refusal still reads as the latest word.
+                if vn in self.runner._udf:
+                    self.setParamStatus(reason, *_UDF_CA)
                 if not accepted and self.runner.alarm_on_refused_write:
                     # Put-completion can only ever report success, so an alarm
                     # is the sole channel available to tell the client its write
@@ -289,6 +445,15 @@ class Runner:
         self.pv_to_var: dict[str, str] = {}  # Map pv name -> variable name
         self.var_to_pv = {}
         self.ca_pvs = {}
+        self._pv_meta = {}
+        # Must be set before the PVs are built: _add_pv's initial value goes
+        # through _generate_value, which reads it.
+        self._udf = frozenset()
+        # Tick state exists whether or not tick_interval_s is set, so the queue
+        # and the run loop never have to ask which kind of runner they serve.
+        self._tick_lock = threading.Lock()
+        self._tick_pending = False
+        self._pass_is_tick = False
         # Base name of the reset control PV -- the key it holds in the pvdb, and
         # the reason the CA driver is called back with. Empty when control PVs
         # are suppressed.
@@ -310,6 +475,21 @@ class Runner:
         self.supports_pva = "pva" in self.protos
 
         self.update_rate = config.get("update_rate", 0.1)
+
+        # Checked before any PV is built, so a bad value fails the whole start.
+        # A bool is refused even though it is an int: True reads as "yes, tick",
+        # not as one second.
+        tick_interval_s = config.get("tick_interval_s")
+        if tick_interval_s is not None and (
+            type(tick_interval_s) not in (int, float)
+            or not math.isfinite(tick_interval_s)
+            or tick_interval_s <= 0
+        ):
+            raise ValueError(
+                "tick_interval_s must be a finite number of seconds greater than zero, "
+                f"or None; got {tick_interval_s!r}"
+            )
+        self._tick_interval_s = tick_interval_s
 
         # Write-path policy. Every default here reproduces the behaviour of a
         # runner that sets none of them.
@@ -359,9 +539,13 @@ class Runner:
                 LOG.warning(f'Unsupported variable "{var.name}". Skipping.')
                 continue
 
+            # Validated only for a variable that is served: a skipped one keeps
+            # its warn-and-skip, whatever its entry carries.
+            self._pv_meta[var.name] = _resolve_pv_meta(c["name"], c, var, handler)
+
             # Cache handler and type for later
             self.pv_handlers[var.name] = handler
-            self.types[var.name] = handler.create_type(var)
+            self.types[var.name] = handler.create_type(var, **self._precision_kwargs(var.name))
 
             self.pv_to_var[pv] = var.name
             self.var_to_pv[var.name] = pv
@@ -489,8 +673,26 @@ class Runner:
                 "done": [done] if done is not None else [],
                 "reset": reset,
                 "jobs": list(jobs),
+                "tick": False,
             }
         )
+
+    def _tick(self) -> None:
+        """
+        Queue one periodic pass, unless one is already waiting.
+
+        Called by the ticker thread every ``tick_interval_s``. The pending flag
+        is checked and set under ``_tick_lock``, set before the item is queued,
+        and cleared only by ``_run_cycle`` when it takes the tick off the queue,
+        so a model slower than the interval sees at most one tick waiting. The
+        item is built fresh on every call: the run loop mutates the items it
+        merges, so no two ticks may share one.
+        """
+        with self._tick_lock:
+            if self._tick_pending:
+                return
+            self._tick_pending = True
+            self.queue.put({"values": {}, "done": [], "reset": False, "jobs": [], "tick": True})
 
     def _clamp_write(self, variable: Variable, value: Any) -> Any:
         """
@@ -595,7 +797,7 @@ class Runner:
                 return
 
             LOG.debug(f"Creating CA PV: pv={pv}")
-            spec = handler.ca_pvspec(var)
+            spec = handler.ca_pvspec(var, **self._precision_kwargs(var.name))
 
             # Keyed by the base name: SimpleServer.createPV prepends the prefix
             # to build the served name, and every callback into the driver --
@@ -704,6 +906,65 @@ class Runner:
         """
         return list(self.model.supported_variables)
 
+    def _evaluate_severity(self, names: list[str]) -> frozenset[str]:
+        """
+        Ask the model which of ``names`` are undefined this cycle.
+
+        A model opts in by defining a callable ``output_severity(names)``; it is
+        called once and must return a dict mapping a variable name to
+        ``{"condition": <condition>}``, where the only known condition is
+        ``"udf"`` (see ``_CONDITIONS``). Keys outside ``names`` are ignored --
+        the model may report on variables this cycle does not publish. The
+        result depends only on the model's reply; runner state is not touched.
+
+        Parameters
+        ----------
+        names : list[str]
+            Variable names published this cycle.
+
+        Returns
+        -------
+        frozenset[str] :
+            The names reported ``"udf"``; empty when the model has no hook.
+
+        Raises
+        ------
+        ValueError
+            The reply is not a dict, or an entry for a requested name is not a
+            dict carrying a known condition. An exception raised by the hook
+            itself propagates unchanged.
+        """
+        hook = getattr(self.model, "output_severity", None)
+        if not callable(hook):
+            return frozenset()
+
+        reply = hook(names)
+        if not isinstance(reply, dict):
+            raise ValueError(
+                f"output_severity must return a dict, got {type(reply).__name__}: {reply!r}"
+            )
+
+        requested = set(names)
+        udf = set()
+        for name, entry in reply.items():
+            if name not in requested:
+                continue
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"output_severity entry for variable '{name}' must be a dict "
+                    f"with a 'condition' key, got {entry!r}"
+                )
+            condition = entry.get("condition")
+            # isinstance first: an unhashable condition would make the
+            # membership test raise TypeError instead of this ValueError.
+            if not isinstance(condition, str) or condition not in _CONDITIONS:
+                raise ValueError(
+                    f"output_severity reported unknown condition {condition!r} for "
+                    f"variable '{name}'; known conditions: {sorted(_CONDITIONS)}"
+                )
+            udf.add(name)
+        return frozenset(udf)
+
     def _extend_pvdb(self) -> dict[str, dict[str, Any]]:
         """
         Additional entries to serve alongside the model's own CA PVs.
@@ -783,15 +1044,50 @@ class Runner:
 
         return None
 
+    def _precision_kwargs(self, name: str) -> dict[str, int]:
+        """Return ``{"precision": p}`` for a float scalar configured with one.
+
+        Only ``ScalarVariableHandler`` (compared by exact type) accepts the
+        keyword; every other handler's ``create_type``/``ca_pvspec`` is called
+        exactly as in 0.1.4, and so is a scalar configured without a precision.
+        """
+        precision = self._pv_meta.get(name, {}).get("precision")
+        if precision is None or type(self.pv_handlers.get(name)) is not ScalarVariableHandler:
+            return {}
+        return {"precision": precision}
+
     def _generate_value(self, pv: str, value: Any | None, ts: float | None = None) -> Value:
         """
         Generates a new value for posting to the PV.
         Handles alarm updates, timestamp updates, and generating the value in the first place. This handles the
         'common' metadata that the variable handlers shouldn't need to handle.
+
+        A name in ``self._udf`` is published with (INVALID_ALARM, UDF_STATUS)
+        in place of the handler's alarm pair. :meth:`_pack_value` never applies
+        that overlay.
         """
-        v = self.pv_handlers[pv].pack_value(
-            self.model.supported_variables[pv], self.types[pv], value
-        )
+        v = self._pack_value(pv, value, ts)
+        if pv in self._udf:
+            v["alarm"]["severity"], v["alarm"]["status"] = _UDF_PVA
+        return v
+
+    def _pack_value(self, pv: str, value: Any | None, ts: float | None = None) -> Value:
+        """
+        Packs ``value`` for ``pv`` with its handler and stamps it with ``ts``
+        (the current UNIX time when omitted).
+        """
+        handler = self.pv_handlers[pv]
+        variable = self.model.supported_variables[pv]
+        v = handler.pack_value(variable, self.types[pv], value)
+
+        # Display metadata from the configuration. Read with .get so a runner
+        # built without __init__ (class default: empty) packs as 0.1.4 did.
+        meta = self._pv_meta.get(pv, {})
+        precision = meta.get("precision")
+        if precision is not None:
+            v["display"]["precision"] = precision
+        if type(handler) in _DESCRIBED_HANDLERS:
+            handler.set_display_metadata(variable, v, description=meta.get("description"))
 
         # Ensure timestamp is current
         self._update_timestamp(v, ts=ts)
@@ -811,14 +1107,79 @@ class Runner:
         """Access the underlying config"""
         return self._config
 
+    def _ticker_join_timeout(self) -> float:
+        """Bound on waiting for a stopping ticker: two intervals, never under 5 s."""
+        return max(2 * (self._tick_interval_s or 0.0), 5.0)
+
+    def _start_ticker(self) -> None:
+        """
+        Start the thread that queues a periodic pass every ``tick_interval_s``.
+
+        A no-op without an interval, or while a ticker is running and has not
+        been asked to stop. A ticker that is stopping is joined first, so two
+        never run at once. The pending flag is reset before the new thread
+        starts: an interrupt between a tick's dequeue and its clear would
+        otherwise leave it set, and no later tick would ever be queued.
+
+        The stop event is held in the thread's closure rather than read from
+        ``self``, so a restart that replaces ``_ticker_stop`` cannot leave an
+        old thread waiting on an event nobody will set.
+        """
+        interval = self._tick_interval_s
+        if interval is None:
+            return
+        ticker, stop = self._ticker, self._ticker_stop
+        if ticker is not None and ticker.is_alive():
+            if stop is not None and not stop.is_set():
+                return
+            ticker.join(timeout=self._ticker_join_timeout())
+        with self._tick_lock:
+            self._tick_pending = False
+        stop = threading.Event()
+
+        def tick_loop() -> None:
+            while not stop.wait(interval):
+                self._tick()
+
+        ticker = threading.Thread(target=tick_loop, name="lume-pva-ticker", daemon=True)
+        self._ticker_stop = stop
+        self._ticker = ticker
+        ticker.start()
+
+    def _stop_ticker(self) -> None:
+        """
+        Stop the ticker thread, if there is one, and wait for it to end.
+
+        The references are dropped only once the thread is dead; a thread still
+        alive after the bounded join is logged and kept, so the next
+        :meth:`_start_ticker` sees it stopping and joins it again.
+        """
+        ticker, stop = self._ticker, self._ticker_stop
+        if ticker is None:
+            return
+        if stop is not None:
+            stop.set()
+        ticker.join(timeout=self._ticker_join_timeout())
+        if ticker.is_alive():
+            LOG.warning("tick thread did not stop within its join timeout; leaving it to exit")
+            return
+        self._ticker = None
+        self._ticker_stop = None
+
     def _run(self):
         """
         Runs the simulation, blocks forever.
         Dequeues PV updates from the updater thread, sets values on the model, and updates outputs.
+        The ticker, when ``tick_interval_s`` is set, runs for exactly as long as
+        this loop does, so a second ``run()`` after an interrupt ticks again.
         """
-        while True:
-            # Wait for new data to come in
-            self._run_cycle(self.queue.get())
+        self._start_ticker()
+        try:
+            while True:
+                # Wait for new data to come in
+                self._run_cycle(self.queue.get())
+        finally:
+            self._stop_ticker()
 
     def _run_cycle(self, item: dict) -> None:
         """
@@ -828,8 +1189,10 @@ class Runner:
         order. Then the model pass runs: snapshot the settable state, reset if
         requested, ``model.set`` the batch's values, read back the variables
         :meth:`_cycle_output_names` lists and publish them. The pass runs only when the batch has something for the
-        model -- values, a reset, or no jobs at all (the empty start-up item
-        publishes the initial outputs). A batch of jobs alone touches the model
+        model -- values, a reset, a tick, or no jobs at all (the empty start-up
+        item publishes the initial outputs). ``_pass_is_tick`` is true only
+        when every item of the batch is a tick and it carries no values and no
+        reset. A batch of jobs alone touches the model
         only through its jobs.
 
         A job owns its operation and its reply, so a job that raises anyway is
@@ -850,6 +1213,13 @@ class Runner:
         reset_requested: bool = item.get("reset", False)
         jobs: list = item.get("jobs", [])
 
+        # A tick taken off the queue clears the pending flag, so the ticker may
+        # queue the next one; the same holds for every tick merged below.
+        any_tick: bool = item.get("tick", False)
+        all_tick: bool = any_tick
+        if any_tick:
+            self._tick_pending = False
+
         # Wait for a time window of 'update_rate' seconds to pass before
         # continuing, batching whatever else arrives into the same cycle.
         #
@@ -867,8 +1237,19 @@ class Runner:
                     done_callbacks.extend(next_update["done"])
                     reset_requested = reset_requested or next_update.get("reset", False)
                     jobs.extend(next_update.get("jobs", []))
+                    next_tick = next_update.get("tick", False)
+                    if next_tick:
+                        self._tick_pending = False
+                    any_tick = any_tick or next_tick
+                    all_tick = all_tick and next_tick
                 except Empty:
                     pass
+
+        # A merged tick makes the batch a tick. Only a batch of ticks alone,
+        # with no values and no reset, is a pure tick pass: the subclass signal
+        # is set here, before the jobs run, and holds for the whole cycle.
+        item["tick"] = any_tick
+        self._pass_is_tick = all_tick and not value_data and not reset_requested
 
         for job in jobs:
             try:
@@ -876,7 +1257,7 @@ class Runner:
             except Exception as exc:
                 LOG.exception(f"Run-loop job failed: ({exc}); continuing the cycle")
 
-        run_pass = bool(value_data) or reset_requested or not jobs
+        run_pass = bool(value_data) or reset_requested or not jobs or any_tick
 
         if run_pass:
             new_values = {}
@@ -926,6 +1307,7 @@ class Runner:
 
                 # Get new simulated values
                 output_names = self._cycle_output_names()
+                self._cycle_requested_names = tuple(output_names)
                 out_values = {}
                 if output_names:
                     get_start = time.perf_counter()
@@ -963,6 +1345,17 @@ class Runner:
         back to its cached state and every waiting put is completed with the
         error.
 
+        A model without a callable ``output_severity`` is published exactly as
+        0.1.4 published it. A model with one is published in two phases, all or
+        nothing. Phase 1 -- the only phase that may raise -- asks the model
+        which names are undefined, builds every PVA Value with an explicit alarm
+        pair and every CA native value, then swaps ``self._udf``. Phase 2
+        publishes what phase 1 built and never raises. A phase-1 failure
+        therefore posts nothing on either transport and leaves ``self._udf`` as
+        it was. Only names this cycle requested are considered:
+        ``LUMEModel.get`` validates those alone, so an extra key a model's
+        ``_get`` returned is neither shown to the hook nor published.
+
         Parameters
         ----------
         out_values : dict[str, Any]
@@ -970,38 +1363,114 @@ class Runner:
         ts : float
             Timestamp to stamp the published values with.
         """
-        LOG.debug(f"writing {len(out_values)} PVs")
-        for k, v in out_values.items():
-            # The model may return None for an output; there is nothing
-            # meaningful to post, and passing it downstream would either
-            # silently substitute the variable default (PVA path) or raise
-            # in value_to_native (CA path). Skip and warn instead.
+        if not callable(getattr(self.model, "output_severity", None)):
+            LOG.debug(f"writing {len(out_values)} PVs")
+            for k, v in out_values.items():
+                # The model may return None for an output; there is nothing
+                # meaningful to post, and passing it downstream would either
+                # silently substitute the variable default (PVA path) or raise
+                # in value_to_native (CA path). Skip and warn instead.
+                if v is None:
+                    LOG.warning(f"Model returned None for output '{k}'; skipping update")
+                    continue
+
+                # Update PVA component
+                pv = self.pvs.get(k)
+                if pv is not None:
+                    try:
+                        pv.post(self._generate_value(k, v, ts))
+                    except Exception as e:
+                        LOG.error(f"Error posting value for {k}: {e}")
+
+                # Update CA component
+                capv = self.ca_pvs.get(k)
+                if capv is not None and self.ca_driver is not None:
+                    # pcaspy can only understand native python types, not necessarily what the model gives us.
+                    nv = self.pv_handlers[k].value_to_native(self.model.supported_variables[k], v)
+
+                    self.ca_driver.setParam(
+                        capv,
+                        nv,
+                        pcaspy.cas.epicsTimeStamp.fromPosixTimeStamp(ts),
+                    )
+
+            if self.ca_driver is not None:
+                self.ca_driver.updatePVs()
+            return
+
+        requested = set(self._cycle_requested_names)
+        names = [n for n in out_values if n in requested]
+
+        # ---- phase 1: evaluate, build, swap ----
+        udf = self._evaluate_severity(names)
+
+        pva_values: list[tuple[str, Any]] = []
+        ca_values: list[tuple[str, Any, bool]] = []
+        for k in names:
+            v = out_values[k]
             if v is None:
                 LOG.warning(f"Model returned None for output '{k}'; skipping update")
                 continue
 
-            # Update PVA component
-            pv = self.pvs.get(k)
-            if pv is not None:
+            if self.pvs.get(k) is not None:
                 try:
-                    pv.post(self._generate_value(k, v, ts))
+                    packed = self._pack_value(k, v, ts)
+                    # Write the pair on every post: p4p's SharedPV.post stores
+                    # only marked fields, so an unwritten pair would leave a
+                    # recovered output stuck at the previous INVALID.
+                    if k in udf:
+                        severity, status = _UDF_PVA
+                    elif packed.changed("alarm.severity"):
+                        severity = packed["alarm"]["severity"]
+                        status = packed["alarm"]["status"]
+                    else:
+                        severity, status = 0, 0
+                    packed["alarm"]["severity"] = severity
+                    packed["alarm"]["status"] = status
+                    pva_values.append((k, packed))
                 except Exception as e:
+                    # An undefined name must reach clients as undefined; one
+                    # that cannot be packed fails the cycle instead.
+                    if k in udf:
+                        raise
                     LOG.error(f"Error posting value for {k}: {e}")
 
-            # Update CA component
             capv = self.ca_pvs.get(k)
             if capv is not None and self.ca_driver is not None:
-                # pcaspy can only understand native python types, not necessarily what the model gives us.
                 nv = self.pv_handlers[k].value_to_native(self.model.supported_variables[k], v)
+                ca_values.append((capv, nv, k in udf))
 
+        # Names this cycle did not read keep their state.
+        self._udf = (self._udf - set(names)) | udf
+
+        # ---- phase 2: publish; nothing below may raise ----
+        LOG.debug(f"writing {len(names)} PVs")
+        for k, packed in pva_values:
+            try:
+                self.pvs[k].post(packed)
+            except Exception as e:
+                LOG.error(f"Error posting value for {k}: {e}")
+
+        if self.ca_driver is None:
+            return
+
+        for capv, nv, is_udf in ca_values:
+            try:
                 self.ca_driver.setParam(
                     capv,
                     nv,
                     pcaspy.cas.epicsTimeStamp.fromPosixTimeStamp(ts),
                 )
+                # setParam recomputes the alarm, so the UDF status follows it.
+                if is_udf:
+                    self.ca_driver.setParamStatus(capv, *_UDF_CA)
+            except Exception as e:
+                LOG.error(f"Error writing CA value for {capv}: {e}")
 
-        if self.ca_driver is not None:
+        try:
             self.ca_driver.updatePVs()
+        except Exception as e:
+            LOG.error(f"Error flushing CA values: {e}")
 
     def run(self):
         """

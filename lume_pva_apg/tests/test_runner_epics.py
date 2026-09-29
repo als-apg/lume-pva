@@ -38,6 +38,7 @@ from lume.exceptions import ReadOnlyError
 from lume.variables.variable import ConfigEnum, Variable
 
 from lume_pva_apg.tests._requires import skip_if_absent
+from lume_pva_apg.tests._spawn import wait_until_ready
 
 # Keep all EPICS traffic on the loopback interface. Must be set before p4p,
 # pyepics, or the pcaspy server (created in Runner.__init__) initialise.
@@ -232,7 +233,7 @@ def harness(request: pytest.FixtureRequest) -> Generator[RunnerHandle, None, Non
         daemon=True,
     )
     proc.start()
-    assert ready.wait(timeout=OP_TIMEOUT), "child Runner never became ready"
+    wait_until_ready(proc, ready)
 
     handle = RunnerHandle(
         release=release,

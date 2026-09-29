@@ -11,6 +11,7 @@ the constructor rejects binds no port; nothing here starts a server or makes a
 network call.
 """
 
+import threading
 import time
 from queue import Queue
 from types import SimpleNamespace
@@ -25,10 +26,39 @@ from lume_pva_apg.tests._requires import skip_if_absent
 # than failing collection, which would take the whole suite with it.
 try:
     from lume.model import LUMEModel
-    from lume.variables import NDVariable, ScalarVariable, Variable
+    from lume.variables import (
+        BoolVariable,
+        EnumVariable,
+        IntVariable,
+        NDVariable,
+        ParticleGroupVariable,
+        ScalarVariable,
+        StrVariable,
+        Variable,
+    )
+    from p4p.server.thread import SharedPV
 
-    from lume_pva_apg.runner import Runner
-    from lume_pva_apg.variables import find_variable_handler
+    from lume_pva_apg.runner import _CONDITIONS, Runner, _resolve_pv_meta
+    from lume_pva_apg.tests._mixed_model import (
+        FAIL_MALFORMED,
+        FAIL_RAISE,
+        FAIL_UDF,
+        MIXED_BOOL,
+        MIXED_ENUM,
+        MIXED_EXTRA_KEY,
+        MIXED_FLOAT_IN,
+        MIXED_FLOAT_OUT,
+        MIXED_INT,
+        MIXED_SEVERITY_TRIGGER,
+        MIXED_STR,
+        MixedModel,
+    )
+    from lume_pva_apg.variables import (
+        TORCH_AVAILABLE,
+        TorchNDVariable,
+        TorchScalarVariable,
+        find_variable_handler,
+    )
 except ImportError as exc:
     skip_if_absent(exc)
 
@@ -192,7 +222,7 @@ def test_control_pvs_create_pva_sharedpvs_when_pva_enabled() -> None:
 # --------------------------------------------------------------------------
 
 
-QUEUE_ITEM_KEYS = {"values", "done", "reset", "jobs"}
+QUEUE_ITEM_KEYS = {"values", "done", "reset", "jobs", "tick"}
 
 
 def _queue_owner() -> SimpleNamespace:
@@ -228,6 +258,7 @@ def test_an_item_enqueued_with_jobs_carries_them_in_order() -> None:
 
     item = _only_item(owner.queue)
     assert set(item) == QUEUE_ITEM_KEYS
+    assert item["tick"] is False
     assert item["jobs"] == [first, second]
     assert calls == []
 
@@ -243,6 +274,8 @@ def test_an_item_enqueued_without_jobs_carries_an_empty_list() -> None:
     one = owner.queue.get_nowait()
     two = owner.queue.get_nowait()
     assert set(one) == QUEUE_ITEM_KEYS
+    assert set(two) == QUEUE_ITEM_KEYS
+    assert one["tick"] is False and two["tick"] is False
     assert one["jobs"] == []
     assert two["jobs"] == []
     assert one["jobs"] is not two["jobs"]
@@ -284,7 +317,7 @@ def test_jobs_travel_alongside_values_done_and_reset() -> None:
     Runner._enqueue(owner, values, done=done, reset=True, jobs=[job])
 
     item = _only_item(owner.queue)
-    assert item == {"values": values, "done": [done], "reset": True, "jobs": [job]}
+    assert item == {"values": values, "done": [done], "reset": True, "jobs": [job], "tick": False}
 
 
 class _QueueRecordingDriver(Runner.CaDriver):
@@ -303,6 +336,312 @@ class _QueueRecordingDriver(Runner.CaDriver):
 
     def callbackPV(self, reason) -> None:
         pass
+
+
+# --------------------------------------------------------------------------
+# tick_interval_s: validation, state and the tick item
+# --------------------------------------------------------------------------
+
+
+def _bare_runner(monkeypatch: pytest.MonkeyPatch, **config_keys: object) -> Runner:
+    """A real ``Runner.__init__`` over a model with no variables and no server.
+
+    PVA only, no control PVs, and the p4p server replaced, so nothing binds a
+    port; the start-up ``_enqueue({})`` still lands on the real queue.
+    """
+    import p4p.server
+
+    monkeypatch.setattr(p4p.server, "Server", lambda *args, **kwargs: None)
+    monkeypatch.setenv("EPICS_CA_MAX_ARRAY_BYTES", "80000000")
+    empty = StubModel({})
+    config = Runner.generate_config(empty)
+    config.update(protocol=["pva"], control_pvs=False, **config_keys)
+    return Runner(model=empty, config=config)
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("-inf"), id="minus-inf"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param(0, id="zero"),
+        pytest.param(0.0, id="zero-float"),
+        pytest.param(-1, id="minus-one"),
+        pytest.param("1.0", id="string"),
+        pytest.param(np.float64(1.0), id="numpy-float"),
+    ],
+)
+def test_an_invalid_tick_interval_is_rejected_naming_the_key(
+    monkeypatch: pytest.MonkeyPatch, interval: object
+) -> None:
+    with pytest.raises(ValueError, match="tick_interval_s"):
+        _bare_runner(monkeypatch, tick_interval_s=interval)
+
+
+@pytest.mark.parametrize("interval", [pytest.param(1, id="int"), pytest.param(0.25, id="float")])
+def test_a_valid_tick_interval_is_stored(monkeypatch: pytest.MonkeyPatch, interval: float) -> None:
+    runner = _bare_runner(monkeypatch, tick_interval_s=interval)
+
+    assert runner._tick_interval_s == interval
+    assert runner._tick_pending is False
+    assert runner._ticker is None
+
+
+@pytest.mark.parametrize(
+    "config_keys",
+    [pytest.param({}, id="absent"), pytest.param({"tick_interval_s": None}, id="none")],
+)
+def test_tick_state_exists_without_a_tick_interval(
+    monkeypatch: pytest.MonkeyPatch, config_keys: dict
+) -> None:
+    runner = _bare_runner(monkeypatch, **config_keys)
+
+    assert runner._tick_interval_s is None
+    assert runner._tick_pending is False
+    assert runner._pass_is_tick is False
+    assert runner._ticker is None
+    assert runner._ticker_stop is None
+    assert isinstance(runner._tick_lock, type(threading.Lock()))
+    startup = runner.queue.get_nowait()
+    assert startup["tick"] is False
+    assert runner.queue.empty()
+
+
+def test_tick_defaults_exist_on_a_runner_built_without_init() -> None:
+    runner = Runner.__new__(Runner)
+
+    assert runner._tick_interval_s is None
+    assert runner._tick_pending is False
+    assert runner._pass_is_tick is False
+    assert runner._ticker is None
+    assert runner._ticker_stop is None
+
+
+def _tick_owner() -> SimpleNamespace:
+    """The only state ``_tick`` touches: the queue, the lock and the flag."""
+    return SimpleNamespace(queue=Queue(), _tick_lock=threading.Lock(), _tick_pending=False)
+
+
+def test_a_tick_queues_a_tick_item_and_sets_the_pending_flag() -> None:
+    owner = _tick_owner()
+
+    Runner._tick(owner)
+
+    item = _only_item(owner.queue)
+    assert item == {"values": {}, "done": [], "reset": False, "jobs": [], "tick": True}
+    assert set(item) == QUEUE_ITEM_KEYS
+    assert owner._tick_pending is True
+
+
+def test_two_ticks_queue_one_tick_item() -> None:
+    """A tick already waiting absorbs the next: a slow model never builds a backlog."""
+    owner = _tick_owner()
+
+    Runner._tick(owner)
+    Runner._tick(owner)
+
+    item = _only_item(owner.queue)
+    assert item["tick"] is True
+
+
+def test_each_tick_item_is_a_new_dict() -> None:
+    """The run loop mutates the items it merges, so no two ticks may share one."""
+    owner = _tick_owner()
+
+    Runner._tick(owner)
+    first = owner.queue.get_nowait()
+    owner._tick_pending = False
+    Runner._tick(owner)
+    second = owner.queue.get_nowait()
+
+    assert first == second
+    assert first is not second
+    for key in ("values", "done", "jobs"):
+        assert first[key] is not second[key]
+
+
+def test_concurrent_ticks_queue_one_tick_item() -> None:
+    owner = _tick_owner()
+    threads = [threading.Thread(target=Runner._tick, args=(owner,)) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    item = _only_item(owner.queue)
+    assert item["tick"] is True
+
+
+TICK_S = 0.05
+
+
+def _wait_until(condition, deadline_s: float = 5.0) -> bool:
+    """Poll ``condition`` until it holds or ``deadline_s`` passes."""
+    deadline = time.monotonic() + deadline_s
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.005)
+    return True
+
+
+def _counting_ticks(runner: Runner) -> list[int]:
+    """Count the ticker's calls to ``_tick``; the real ``_tick`` still runs."""
+    calls = [0]
+    real_tick = runner._tick
+
+    def tick() -> None:
+        calls[0] += 1
+        real_tick()
+
+    runner._tick = tick
+    return calls
+
+
+def test_a_real_ticker_coalesces_ticks_with_no_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing drains the queue, so every tick after the first finds one pending."""
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+    calls = _counting_ticks(runner)
+
+    runner._start_ticker()
+    try:
+        ticker = runner._ticker
+        assert ticker is not None and ticker.daemon and ticker.is_alive()
+        assert _wait_until(lambda: runner.queue.qsize() >= 2), "no tick within 5 s"
+        seen = calls[0]
+        assert _wait_until(lambda: calls[0] >= seen + 5), "the ticker stopped ticking"
+    finally:
+        runner._stop_ticker()
+
+    items = []
+    while not runner.queue.empty():
+        items.append(runner.queue.get_nowait())
+    assert len(items) == 2
+    assert [item["tick"] for item in items] == [False, True]
+    assert runner._tick_pending is True
+    assert not ticker.is_alive()
+    assert runner._ticker is None
+    assert runner._ticker_stop is None
+
+
+def test_starting_the_ticker_resets_a_stuck_pending_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt between a tick's dequeue and its clear must not wedge the next run."""
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+    runner.queue.get_nowait()  # the start-up item
+    runner._tick_pending = True
+
+    runner._start_ticker()
+    try:
+        ticker = runner._ticker
+        assert _wait_until(lambda: not runner.queue.empty()), "no tick within 5 s"
+    finally:
+        runner._stop_ticker()
+
+    assert runner.queue.get_nowait()["tick"] is True
+    assert not ticker.is_alive()
+
+
+def test_starting_a_running_ticker_again_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+
+    runner._start_ticker()
+    try:
+        ticker, stop = runner._ticker, runner._ticker_stop
+        runner._tick_pending = True
+        runner._start_ticker()
+        assert runner._ticker is ticker
+        assert runner._ticker_stop is stop
+        assert runner._tick_pending is True
+    finally:
+        runner._stop_ticker()
+    assert not ticker.is_alive()
+
+
+def test_a_stopped_ticker_can_be_started_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+
+    runner._start_ticker()
+    first = runner._ticker
+    runner._stop_ticker()
+    runner._start_ticker()
+    try:
+        second = runner._ticker
+        assert second is not None and second is not first
+        assert second.is_alive()
+        assert runner._ticker_stop is not None and not runner._ticker_stop.is_set()
+    finally:
+        runner._stop_ticker()
+    assert not first.is_alive() and not second.is_alive()
+
+
+def test_a_ticker_still_alive_after_the_join_is_kept_and_joined_on_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread that outlives the bounded join keeps its references, so a restart joins it."""
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, daemon=True)
+    stuck.start()
+    stop = threading.Event()
+    runner._ticker, runner._ticker_stop = stuck, stop
+    joins: list = []
+    real_join = stuck.join
+
+    def join(timeout=None):
+        joins.append(timeout)
+        if len(joins) == 2:
+            release.set()
+        real_join(timeout=0.01 if len(joins) == 1 else timeout)
+
+    stuck.join = join
+    try:
+        runner._stop_ticker()
+        assert stop.is_set()
+        assert joins == [5.0]
+        assert runner._ticker is stuck
+        assert runner._ticker_stop is stop
+
+        runner._start_ticker()
+        assert joins == [5.0, 5.0]
+        assert runner._ticker is not stuck
+        assert runner._ticker.is_alive()
+    finally:
+        release.set()
+        runner._stop_ticker()
+
+
+def test_without_an_interval_the_ticker_calls_are_no_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _bare_runner(monkeypatch)
+    threads_before = threading.active_count()
+
+    runner._start_ticker()
+    assert runner._ticker is None
+    assert threading.active_count() == threads_before
+    runner._stop_ticker()
+    assert runner._ticker is None
+
+
+def test_run_starts_the_ticker_and_stops_it_when_the_loop_ends() -> None:
+    runner = Runner.__new__(Runner)
+    runner.queue = Queue()
+    runner.queue.put(_item())
+    events: list[str] = []
+    runner._start_ticker = lambda: events.append("start")
+    runner._stop_ticker = lambda: events.append("stop")
+
+    def cycle(item: dict) -> None:
+        events.append("cycle")
+        raise KeyboardInterrupt
+
+    runner._run_cycle = cycle
+
+    with pytest.raises(KeyboardInterrupt):
+        runner._run()
+
+    assert events == ["start", "cycle", "stop"]
 
 
 def _runner_with_queue(protocol: list[str]) -> Runner:
@@ -330,6 +669,7 @@ def test_a_ca_variable_write_enqueues_no_jobs() -> None:
 
     item = _only_item(runner.queue)
     assert set(item) == QUEUE_ITEM_KEYS
+    assert item["tick"] is False
     assert item["values"]["input_a"]["value"] == 4.2
     assert len(item["done"]) == 1
     assert item["reset"] is False
@@ -344,7 +684,7 @@ def test_a_ca_reset_write_enqueues_no_jobs() -> None:
     assert driver.write(runner.reset_control_pv, 1) is True
 
     item = _only_item(runner.queue)
-    assert item == {"values": {}, "done": [], "reset": True, "jobs": []}
+    assert item == {"values": {}, "done": [], "reset": True, "jobs": [], "tick": False}
 
 
 def test_a_pva_reset_put_enqueues_no_jobs() -> None:
@@ -358,7 +698,7 @@ def test_a_pva_reset_put_enqueues_no_jobs() -> None:
     on_put(runner.providers["RESET"], op)
 
     item = _only_item(runner.queue)
-    assert item == {"values": {}, "done": [], "reset": True, "jobs": []}
+    assert item == {"values": {}, "done": [], "reset": True, "jobs": [], "tick": False}
 
 
 # --------------------------------------------------------------------------
@@ -666,6 +1006,221 @@ def test_batching_values_behind_a_jobs_only_item_runs_the_cycle_pass() -> None:
 
 
 # --------------------------------------------------------------------------
+# periodic passes: the run cycle takes ticks off the queue and merges them
+# --------------------------------------------------------------------------
+
+
+class _TickWatchingModel(CycleModel):
+    """``CycleModel`` that records the runner's ``_pass_is_tick`` at every
+    ``set`` and ``get``, so a test sees what the model itself would see."""
+
+    runner: Runner | None = None
+
+    def _get(self, names) -> dict[str, float]:
+        self.events.append(("tick_seen", self.runner._pass_is_tick))
+        return super()._get(names)
+
+    def _set(self, values: dict) -> None:
+        self.events.append(("tick_seen", self.runner._pass_is_tick))
+        super()._set(values)
+
+
+def _tick_cycle_runner(events: list, *, update_rate: float = 0.0) -> Runner:
+    """``_cycle_runner`` with the tick state ``__init__`` would create and a
+    model that reports ``_pass_is_tick`` from inside ``set``/``get``."""
+    runner = _cycle_runner(events, update_rate=update_rate)
+    runner._tick_lock = threading.Lock()
+    runner._tick_pending = False
+    runner._pass_is_tick = False
+    model = _TickWatchingModel(events)
+    model.runner = runner
+    runner.model = model
+    return runner
+
+
+def _tick_probe(events: list, runner: Runner):
+    """A job that records ``_pass_is_tick`` as the jobs of a cycle see it."""
+
+    def job() -> None:
+        events.append(("job_tick_seen", runner._pass_is_tick))
+
+    return job
+
+
+def _tick_seen(events: list) -> list:
+    return [event[1] for event in events if event[0] in ("tick_seen", "job_tick_seen")]
+
+
+def test_ticks_driven_by_hand_keep_at_most_one_queued() -> None:
+    """Ticks from a ticker faster than the loop pile up as one item; taking it
+    off the queue and running it frees the ticker to queue the next."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+
+    runner._tick()
+    runner._tick()
+    runner._tick()
+    assert runner.queue.qsize() == 1
+    assert runner._tick_pending is True
+
+    runner._run_cycle(runner.queue.get())
+
+    assert runner._tick_pending is False
+    assert runner.queue.empty()
+    runner._tick()
+    runner._tick()
+    assert runner.queue.qsize() == 1
+
+
+def test_a_tick_item_clears_the_pending_flag_at_the_top_of_the_cycle() -> None:
+    """The flag is already clear when the cycle's jobs run, so a tick raised
+    during a slow pass is queued rather than dropped."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick()
+    item = runner.queue.get()
+    flags: list = []
+    item["jobs"].append(lambda: flags.append(runner._tick_pending))
+
+    runner._run_cycle(item)
+
+    assert flags == [False]
+    assert runner._tick_pending is False
+
+
+def test_a_tick_merged_in_the_batching_window_does_not_stop_later_ticks() -> None:
+    """With ``update_rate=0.1`` a tick queued behind a write is merged into the
+    write's cycle. Merging it must clear the flag too, or the ticker would
+    believe a tick is still waiting and never queue another."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=0.1)
+    runner._enqueue({IN_X: _write(1.0, 2.0)})
+    runner._tick()
+    assert runner.queue.qsize() == 2
+
+    item = runner.queue.get()
+    runner._run_cycle(item)
+
+    assert runner.queue.empty()
+    assert runner._tick_pending is False
+    assert item["tick"] is True
+    assert _sets(events) == [{IN_X: 1.0}]
+    assert runner._pass_is_tick is False
+
+    runner._tick()
+    assert runner.queue.qsize() == 1
+    assert runner.queue.get()["tick"] is True
+
+
+def test_a_tick_merged_into_a_jobs_only_item_runs_the_pass_but_not_as_a_tick() -> None:
+    """Jobs alone skip the pass; a merged tick makes the batch publish. The
+    batch is not ticks alone, so ``_pass_is_tick`` stays false throughout."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._tick()
+
+    item = _item(jobs=[_tick_probe(events, runner)])
+    item["tick"] = False
+    runner._run_cycle(item)
+
+    assert item["tick"] is True
+    assert runner._tick_pending is False
+    assert _sets(events) == [{}]
+    assert _kinds(events)[-1] == "post"
+    assert _tick_seen(events) and not any(_tick_seen(events))
+    assert runner._pass_is_tick is False
+
+
+def test_the_start_up_item_merged_with_a_tick_publishes_but_not_as_a_tick() -> None:
+    """The start-up ``{}`` item is not a tick: merged with one, the pass runs
+    (it would anyway) and ``_pass_is_tick`` is false."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._enqueue({})
+    runner._tick()
+
+    runner._run_cycle(runner.queue.get())
+
+    assert _kinds(events)[-1] == "post"
+    assert _tick_seen(events) and not any(_tick_seen(events))
+    assert runner._pass_is_tick is False
+    assert runner._tick_pending is False
+
+
+def test_a_pure_tick_pass_is_visible_to_the_model_during_set_and_get() -> None:
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick()
+
+    runner._run_cycle(runner.queue.get())
+
+    assert _sets(events) == [{}]
+    assert _kinds(events)[-1] == "post"
+    seen = [event for event in events if event[0] == "tick_seen"]
+    assert len(seen) == 3  # snapshot get, set, output get
+    assert all(flag is True for _, flag in seen)
+    assert runner._pass_is_tick is True
+
+
+def test_a_pure_tick_batch_of_several_ticks_is_a_tick_pass() -> None:
+    """Every item of the batch a tick, no values, no reset: still a tick pass."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._tick()
+    runner._tick_pending = False
+    runner._tick()
+
+    runner._run_cycle(runner.queue.get())
+
+    assert runner.queue.empty()
+    assert runner._pass_is_tick is True
+    assert runner._tick_pending is False
+
+
+def test_a_tick_with_a_reset_is_not_a_tick_pass() -> None:
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._tick()
+    runner._enqueue({}, reset=True)
+
+    runner._run_cycle(runner.queue.get())
+
+    assert ("reset",) in events
+    assert runner._pass_is_tick is False
+
+
+def test_a_jobs_only_cycle_after_a_tick_pass_is_not_a_tick() -> None:
+    """``_pass_is_tick`` is reassigned every cycle, before the jobs run, so a
+    tick pass cannot leak its flag into the next cycle's jobs."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick()
+    runner._run_cycle(runner.queue.get())
+    assert runner._pass_is_tick is True
+    events.clear()
+
+    runner._run_cycle(_item(jobs=[_tick_probe(events, runner)]))
+
+    assert events == [("job_tick_seen", False)]
+    assert runner._pass_is_tick is False
+
+
+def test_an_item_without_a_tick_key_runs_the_cycle_as_before() -> None:
+    """Hand-built and subclass items may lack ``"tick"``: read as no tick."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick_pending = True
+    item = _item({IN_X: _write(1.0, 3.0)})
+
+    runner._run_cycle(item)
+
+    assert item["tick"] is False
+    assert runner._pass_is_tick is False
+    assert runner._tick_pending is True
+    assert _sets(events) == [{IN_X: 1.0}]
+
+
+# --------------------------------------------------------------------------
 # the post-cycle read: _cycle_output_names narrows it
 # --------------------------------------------------------------------------
 
@@ -824,3 +1379,976 @@ def test_published_values_carry_wall_clock_timestamps(model: StubModel) -> None:
     after = time.time()
     stamped = value["timeStamp"]["secondsPastEpoch"] + value["timeStamp"]["nanoseconds"] / 1e9
     assert before - 1.0 <= stamped <= after + 1.0
+
+
+def _meta_stub(var: Variable, meta: dict | None = None) -> Runner:
+    """A server-free runner packing ``var`` under the name ``x``, its type built
+    the way ``__init__`` builds it for ``meta``."""
+    runner = _make_model_info_stub(StubModel({"x": var}), {})
+    handler = find_variable_handler(type(var))
+    runner.pv_handlers = {"x": handler}
+    if meta is not None:
+        runner._pv_meta = {"x": meta}
+    runner.types = {"x": handler.create_type(var, **runner._precision_kwargs("x"))}
+    return runner
+
+
+@pytest.mark.parametrize(
+    "var, value",
+    [
+        pytest.param(ScalarVariable(name="x", value_range=(0.0, 10.0), unit="mm"), 2.5, id="float"),
+        pytest.param(EnumVariable(name="x", options=["A", "B", "C"]), "B", id="enum"),
+    ],
+)
+def test_generate_value_and_pack_value_agree(var: Variable, value: object) -> None:
+    """``_generate_value`` delegates to ``_pack_value``: with the same fixed
+    timestamp both produce the same fields and the same changed set."""
+    runner = _meta_stub(var)
+    ts = 1_700_000_000.25
+
+    generated = runner._generate_value("x", value, ts)
+    packed = runner._pack_value("x", value, ts)
+
+    assert generated.todict() == packed.todict()
+    assert generated.changedSet() == packed.changedSet()
+    assert packed["timeStamp"]["secondsPastEpoch"] == 1_700_000_000
+
+
+# --- precision / description metadata (F1.1) --------------------------------
+
+
+class DescribedScalarVariable(ScalarVariable):
+    """A ScalarVariable carrying lume-base 0.6's ``description`` field, declared
+    here so the fallback is testable against a lume-base that predates it."""
+
+    description: str | None = None
+
+
+class DescribedNDVariable(NDVariable):
+    description: str | None = None
+
+
+def _meta(var: Variable, **entry: object) -> dict:
+    handler = find_variable_handler(type(var))
+    assert handler is not None
+    return _resolve_pv_meta(var.name, {"name": var.name, **entry}, var, handler)
+
+
+def _nd() -> NDVariable:
+    return NDVariable(name="arr", shape=(2,), dtype=np.float64)
+
+
+def _torch_meta_cases() -> list:
+    if not TORCH_AVAILABLE:
+        return []
+    import torch
+
+    return [
+        pytest.param(TorchScalarVariable(name="ts"), id="torch-scalar"),
+        pytest.param(TorchNDVariable(name="tnd", shape=(2,), dtype=torch.float32), id="torch-nd"),
+    ]
+
+
+def test_an_entry_without_meta_keys_resolves_to_none() -> None:
+    assert _meta(ScalarVariable(name="x")) == {"precision": None, "description": None}
+
+
+@pytest.mark.parametrize("precision", [0, 3, 17])
+def test_a_precision_in_range_on_a_float_scalar_is_kept(precision: int) -> None:
+    assert _meta(ScalarVariable(name="x"), precision=precision)["precision"] == precision
+
+
+@pytest.mark.parametrize(
+    "precision",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(18, id="above-17"),
+        pytest.param(True, id="bool"),
+        pytest.param(2.0, id="float"),
+        pytest.param("3", id="str"),
+        pytest.param(None, id="none"),
+    ],
+)
+def test_a_malformed_precision_is_rejected(precision: object) -> None:
+    """``type(p) is int`` and 0..17: a bool is an int to isinstance, but True
+    is not a digit count, and an explicit None is a typo rather than an absence."""
+    with pytest.raises(ValueError, match=r"x.*'precision'"):
+        _meta(ScalarVariable(name="x"), precision=precision)
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        pytest.param(IntVariable(name="v"), id="int"),
+        pytest.param(BoolVariable(name="v"), id="bool"),
+        pytest.param(StrVariable(name="v"), id="str"),
+        pytest.param(EnumVariable(name="v", options=["A", "B"]), id="enum"),
+        pytest.param(NDVariable(name="v", shape=(2,), dtype=np.float64), id="nd"),
+        *_torch_meta_cases(),
+    ],
+)
+def test_a_precision_on_anything_but_a_float_scalar_is_rejected(var: Variable) -> None:
+    """Only a float NTScalar has digits after the decimal point to limit;
+    IntVariable shares the float handler, so it is excluded by type."""
+    with pytest.raises(ValueError, match=f"{var.name}.*'precision'"):
+        _meta(var, precision=3)
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        pytest.param(ScalarVariable(name="v"), id="float"),
+        pytest.param(IntVariable(name="v"), id="int"),
+        pytest.param(BoolVariable(name="v"), id="bool"),
+        pytest.param(StrVariable(name="v"), id="str"),
+        pytest.param(EnumVariable(name="v", options=["A", "B"]), id="enum"),
+    ],
+)
+def test_a_config_description_is_kept_on_every_display_type(var: Variable) -> None:
+    assert _meta(var, description="beam current")["description"] == "beam current"
+
+
+@pytest.mark.parametrize("description", [pytest.param(3, id="int"), pytest.param(None, id="none")])
+def test_a_non_str_description_is_rejected(description: object) -> None:
+    with pytest.raises(ValueError, match=r"x.*'description'"):
+        _meta(ScalarVariable(name="x"), description=description)
+
+
+@pytest.mark.parametrize("var", [pytest.param(_nd(), id="nd"), *_torch_meta_cases()])
+def test_a_config_description_on_an_array_or_torch_variable_is_rejected(var: Variable) -> None:
+    """These PVA types have no display block to carry it; accepted, it would
+    be silently dropped."""
+    with pytest.raises(ValueError, match=f"{var.name}.*'description'"):
+        _meta(var, description="beam current")
+
+
+def test_an_empty_config_description_means_none_and_beats_the_variable() -> None:
+    var = DescribedScalarVariable(name="x", description="from the model")
+    assert _meta(var, description="")["description"] is None
+
+
+def test_the_variable_description_is_the_fallback() -> None:
+    var = DescribedScalarVariable(name="x", description="from the model")
+    assert _meta(var)["description"] == "from the model"
+    assert _meta(var, description="from config")["description"] == "from config"
+
+
+def test_an_empty_variable_description_means_none() -> None:
+    assert _meta(DescribedScalarVariable(name="x", description=""))["description"] is None
+
+
+def test_a_variable_description_on_an_array_is_ignored_not_rejected() -> None:
+    """A lume-base 0.6 model may describe an array; it must still boot."""
+    var = DescribedNDVariable(
+        name="arr", shape=(2,), dtype=np.dtype(np.float64), description="an image"
+    )
+    assert _meta(var) == {"precision": None, "description": None}
+
+
+def test_resolving_meta_never_mutates_the_entry_or_the_variable() -> None:
+    var = DescribedScalarVariable(name="x", description="from the model")
+    entry = {"name": "x", "precision": 2}
+    before = var.model_dump()
+    _resolve_pv_meta("x", entry, var, find_variable_handler(type(var)))
+    assert entry == {"name": "x", "precision": 2}
+    assert var.model_dump() == before
+
+
+def test_a_bad_meta_entry_is_rejected_before_any_server_exists(
+    model: StubModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import p4p.server
+    import pcaspy
+
+    def no_server(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a server was created before validation failed")
+
+    monkeypatch.setattr(p4p.server, "Server", no_server)
+    monkeypatch.setattr(pcaspy, "SimpleServer", no_server)
+    config = Runner.generate_config(model)
+    config["variables"]["input_a"]["precision"] = 99
+
+    with pytest.raises(ValueError, match=r"input_a.*'precision'"):
+        Runner(model=model, config=config)
+
+
+def test_the_runner_class_default_pv_meta_is_empty_and_read_only() -> None:
+    runner = Runner.__new__(Runner)
+    assert dict(runner._pv_meta) == {}
+    with pytest.raises(TypeError):
+        runner._pv_meta["x"] = {}  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "skipped",
+    [
+        pytest.param(ParticleGroupVariable(name="skipped"), id="particle-group"),
+        pytest.param(
+            NDVariable(name="skipped", shape=(2,), dtype=np.complex128), id="unsupported-nd"
+        ),
+    ],
+)
+def test_a_skipped_variable_carrying_a_description_is_skipped_not_rejected(
+    skipped: Variable,
+) -> None:
+    """Validation runs after the skips, so 0.1.4's warn-and-skip is unchanged.
+
+    A typo-named entry after the skipped one stops the constructor with a
+    KeyError before any server exists: reaching it proves the skipped entry's
+    description and precision raised nothing.
+    """
+    model = StubModel({"skipped": skipped})
+    config = Runner.generate_config(model)
+    config["variables"]["skipped"]["description"] = "not servable"
+    config["variables"]["skipped"]["precision"] = 3
+    config["variables"]["later"] = {"name": "later_typo", "pv": "later"}
+
+    with pytest.raises(KeyError, match="later_typo"):
+        Runner(model=model, config=config)
+
+
+# --- precision / description wiring (F1.3, F1.4) ---------------------------
+
+
+def test_a_configured_precision_is_packed_as_display_precision() -> None:
+    runner = _meta_stub(ScalarVariable(name="x"), {"precision": 4, "description": None})
+
+    packed = runner._pack_value("x", 1.25)
+
+    assert packed["display"]["precision"] == 4
+    assert "format" not in packed["display"].keys()
+
+
+def test_a_float_without_precision_keeps_its_0_1_4_display_block() -> None:
+    runner = _meta_stub(ScalarVariable(name="x"), {"precision": None, "description": None})
+
+    packed = runner._pack_value("x", 1.25)
+
+    assert "precision" not in packed["display"].keys()
+    assert "format" in packed["display"].keys()
+
+
+@pytest.mark.parametrize(
+    "var, value",
+    [
+        pytest.param(ScalarVariable(name="x"), 1.0, id="float"),
+        pytest.param(IntVariable(name="x"), 2, id="int"),
+        pytest.param(BoolVariable(name="x"), True, id="bool"),
+        pytest.param(StrVariable(name="x"), "s", id="str"),
+        pytest.param(EnumVariable(name="x", options=["A", "B"]), "B", id="enum"),
+    ],
+)
+def test_a_configured_description_is_packed_as_display_description(
+    var: Variable, value: object
+) -> None:
+    runner = _meta_stub(var, {"precision": None, "description": "what it is"})
+
+    packed = runner._pack_value("x", value)
+
+    assert packed["display"]["description"] == "what it is"
+
+
+def test_an_nd_variable_is_packed_without_display_metadata() -> None:
+    """The ND handler's type has no display block; the runner must not write one."""
+    runner = _meta_stub(_nd(), {"precision": None, "description": None})
+
+    packed = runner._pack_value("x", np.zeros(2))
+
+    assert "display" not in packed.keys()
+
+
+def test_precision_is_passed_only_to_a_float_scalar_handler() -> None:
+    """``create_type``/``ca_pvspec`` get a ``precision`` keyword only from a
+    ScalarVariableHandler with one configured; every other call is 0.1.4's."""
+    runner = _make_model_info_stub(StubModel({}), {})
+    runner.pv_handlers = {
+        "float": find_variable_handler(ScalarVariable),
+        "plain": find_variable_handler(ScalarVariable),
+        "enum": find_variable_handler(EnumVariable),
+    }
+    runner._pv_meta = {
+        "float": {"precision": 3, "description": None},
+        "plain": {"precision": None, "description": None},
+        "enum": {"precision": 3, "description": None},
+    }
+
+    assert runner._precision_kwargs("float") == {"precision": 3}
+    assert runner._precision_kwargs("plain") == {}
+    assert runner._precision_kwargs("enum") == {}
+    assert runner._precision_kwargs("unknown") == {}
+
+
+@pytest.mark.parametrize(
+    "var, meta, expected",
+    [
+        pytest.param(ScalarVariable(name="x"), {"precision": 2}, 2, id="configured"),
+        pytest.param(ScalarVariable(name="x"), {"precision": None}, None, id="unconfigured"),
+        pytest.param(IntVariable(name="x"), None, None, id="int-no-meta"),
+    ],
+)
+def test_add_pv_puts_a_configured_precision_in_the_ca_pvspec(
+    var: Variable, meta: dict | None, expected: int | None
+) -> None:
+    """``_add_pv`` reads the precision from ``_pv_meta``: ``prec`` is in the
+    pvdb spec exactly when one is configured."""
+    runner = _meta_stub(var, meta)
+    runner.supports_pva = False
+    runner.supports_ca = True
+    runner.pvdb = {}
+    runner.ca_pvs = {}
+
+    runner._add_pv("X_PV", var, ro=False, prefix="", handler=runner.pv_handlers["x"])
+
+    assert runner.pvdb["X_PV"].get("prec") == expected
+
+
+# --------------------------------------------------------------------------
+# undefined (UDF) alarm overlay
+# --------------------------------------------------------------------------
+
+
+def _alarm(value) -> tuple[int, int]:
+    return value["alarm"]["severity"], value["alarm"]["status"]
+
+
+def _udf_pv_stub(var: Variable) -> tuple[Runner, SharedPV]:
+    """A server-free runner serving ``var`` as ``x`` on a real SharedPV, built
+    the way ``_add_pv`` builds it."""
+    runner = _meta_stub(var)
+    pv = SharedPV(
+        handler=Runner.Handler(variable=var, runner=runner, read_only=var.read_only),
+        initial=runner._generate_value("x", None),
+    )
+    return runner, pv
+
+
+def test_the_runner_class_default_udf_is_an_empty_frozenset() -> None:
+    runner = Runner.__new__(Runner)
+    assert runner._udf == frozenset()
+    assert isinstance(runner._udf, frozenset)
+
+
+def test_a_udf_name_posted_via_generate_value_carries_invalid_udf() -> None:
+    runner, pv = _udf_pv_stub(ScalarVariable(name="x", value_range=(0.0, 10.0), read_only=True))
+    runner._udf = frozenset({"x"})
+
+    pv.post(runner._generate_value("x", 2.5))
+
+    assert _alarm(pv.current()) == (3, 6)
+    assert pv.current()["value"] == 2.5
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        pytest.param(2.5, (0, 0), id="in-range"),
+        pytest.param(20.0, (2, 2), id="out-of-range"),
+    ],
+)
+def test_a_name_not_in_udf_carries_the_handler_alarm_pair(value: float, expected: tuple) -> None:
+    runner, pv = _udf_pv_stub(ScalarVariable(name="x", value_range=(0.0, 10.0), read_only=True))
+    runner._udf = frozenset({"other"})
+
+    pv.post(runner._generate_value("x", value))
+
+    assert _alarm(pv.current()) == expected
+
+
+def test_pack_value_never_applies_the_udf_overlay() -> None:
+    runner = _meta_stub(ScalarVariable(name="x", value_range=(0.0, 10.0)))
+    runner._udf = frozenset({"x"})
+    ts = 1_700_000_000.25
+
+    packed = runner._pack_value("x", 2.5, ts)
+    generated = runner._generate_value("x", 2.5, ts)
+
+    assert _alarm(packed) == (0, 0)
+    assert _alarm(generated) == (3, 6)
+    assert generated["value"] == packed["value"]
+
+
+def test_the_add_pv_initial_value_with_an_empty_udf_is_unchanged_from_0_1_4() -> None:
+    """With nothing undefined, the initial value is exactly what the handler
+    packs -- the 0.1.4 value -- apart from the wall-clock timestamp."""
+    var = ScalarVariable(name="x", value_range=(0.0, 10.0))
+    runner = _meta_stub(var)
+    runner._udf = frozenset()
+    runner.supports_pva = True
+    runner.supports_ca = False
+
+    runner._add_pv("x", var, False, "", runner.pv_handlers["x"])
+
+    initial = runner.pvs["x"].current()
+    packed = runner._pack_value("x", None)
+    strip = lambda d: {k: v for k, v in d.items() if k != "timeStamp"}  # noqa: E731
+    assert strip(initial.todict()) == strip(packed.todict())
+    assert _alarm(initial) == _alarm(packed)
+
+
+def test_a_put_carrying_alarm_fields_leaves_a_standing_udf_alarm() -> None:
+    """The client's alarm leaves are unmarked before either echo, so a put
+    cannot overwrite the stored (INVALID, UDF) pair."""
+    var = ScalarVariable(name="x", value_range=(-10.0, 10.0))
+    runner, pv = _udf_pv_stub(var)
+    runner._udf = frozenset({"x"})
+    pv.post(runner._generate_value("x", 1.0))
+    runner.echo_unconfirmed_writes = True
+    runner.clamp_writes = False
+    runner._enqueue = lambda values, done=None, **kw: done(None)
+
+    put = runner.types["x"](
+        {"value": 4.2, "alarm": {"severity": 0, "status": 0, "message": "client"}}
+    )
+    put.mark("value")
+    put.mark("alarm.severity")
+    put.mark("alarm.status")
+    put.mark("alarm.message")
+    finished = []
+    op = SimpleNamespace(value=lambda: put, done=lambda error=None: finished.append(error))
+
+    Runner.Handler(variable=var, runner=runner, read_only=False).put(pv, op)
+
+    stored = pv.current()
+    assert finished == [None]
+    assert stored["value"] == 4.2
+    assert _alarm(stored) == (3, 6)
+    assert stored["alarm"]["message"] != "client"
+
+
+# --------------------------------------------------------------------------
+# output_severity hook evaluation
+# --------------------------------------------------------------------------
+
+
+def _severity_runner(**model_attrs) -> Runner:
+    """A server-free runner whose model carries only ``model_attrs``."""
+    runner = Runner.__new__(Runner)
+    runner.model = SimpleNamespace(**model_attrs)
+    return runner
+
+
+def test_severity_conditions_table_maps_udf_to_the_pva_and_ca_pairs() -> None:
+    import pcaspy
+
+    assert set(_CONDITIONS) == {"udf"}
+    pva, ca = _CONDITIONS["udf"]
+    assert pva == (3, 6)
+    assert ca == (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM)
+
+
+def test_severity_without_a_hook_is_an_empty_frozenset() -> None:
+    runner = _severity_runner()
+    assert runner._evaluate_severity(["a", "b"]) == frozenset()
+
+
+def test_severity_with_a_non_callable_hook_attribute_is_an_empty_frozenset() -> None:
+    runner = _severity_runner(output_severity={"a": {"condition": "udf"}})
+    assert runner._evaluate_severity(["a"]) == frozenset()
+
+
+def test_severity_valid_reply_returns_the_udf_names_and_calls_the_hook_once() -> None:
+    calls = []
+
+    def hook(names):
+        calls.append(list(names))
+        return {"a": {"condition": "udf"}, "c": {"condition": "udf"}}
+
+    runner = _severity_runner(output_severity=hook)
+    result = runner._evaluate_severity(["a", "b", "c"])
+
+    assert result == frozenset({"a", "c"})
+    assert isinstance(result, frozenset)
+    assert calls == [["a", "b", "c"]]
+
+
+def test_severity_empty_reply_returns_an_empty_frozenset() -> None:
+    runner = _severity_runner(output_severity=lambda names: {})
+    assert runner._evaluate_severity(["a"]) == frozenset()
+
+
+def test_severity_reply_keys_outside_the_requested_names_are_ignored() -> None:
+    # Keys outside ``names`` are ignored whatever their value, even malformed.
+    runner = _severity_runner(
+        output_severity=lambda names: {
+            "a": {"condition": "udf"},
+            "other": {"condition": "udf"},
+            "junk": {"condition": "nonsense"},
+            "worse": 42,
+        }
+    )
+    assert runner._evaluate_severity(["a", "b"]) == frozenset({"a"})
+
+
+def test_severity_unknown_condition_raises_naming_condition_and_variable() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"b": {"condition": "stale"}})
+    with pytest.raises(ValueError) as info:
+        runner._evaluate_severity(["a", "b"])
+    assert "stale" in str(info.value)
+    assert "b" in str(info.value)
+
+
+def test_severity_unhashable_condition_raises_value_error() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"b": {"condition": ["udf"]}})
+    with pytest.raises(ValueError, match="b"):
+        runner._evaluate_severity(["b"])
+
+
+def test_severity_entry_without_a_condition_raises_naming_the_variable() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"speed": {}})
+    with pytest.raises(ValueError, match="speed"):
+        runner._evaluate_severity(["speed"])
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        pytest.param(None, id="none"),
+        pytest.param(["a"], id="list"),
+        pytest.param("udf", id="str"),
+        pytest.param({"a"}, id="set"),
+    ],
+)
+def test_severity_non_dict_reply_raises(reply) -> None:
+    runner = _severity_runner(output_severity=lambda names: reply)
+    with pytest.raises(ValueError):
+        runner._evaluate_severity(["a"])
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        pytest.param("udf", id="str"),
+        pytest.param(None, id="none"),
+        pytest.param(["udf"], id="list"),
+    ],
+)
+def test_severity_non_dict_entry_raises_naming_the_variable(entry) -> None:
+    runner = _severity_runner(output_severity=lambda names: {"speed": entry})
+    with pytest.raises(ValueError, match="speed"):
+        runner._evaluate_severity(["speed"])
+
+
+def test_severity_exception_from_the_hook_propagates_unchanged() -> None:
+    class HookFailure(RuntimeError):
+        pass
+
+    def hook(names):
+        raise HookFailure("model cannot tell")
+
+    runner = _severity_runner(output_severity=hook)
+    with pytest.raises(HookFailure, match="model cannot tell"):
+        runner._evaluate_severity(["a"])
+
+
+def test_severity_evaluation_does_not_touch_the_runner_udf_state() -> None:
+    runner = _severity_runner(output_severity=lambda names: {"a": {"condition": "udf"}})
+    runner._udf = frozenset({"z"})
+    runner._evaluate_severity(["a"])
+    assert runner._udf == frozenset({"z"})
+
+
+# --------------------------------------------------------------------------
+# _post_outputs: two-phase publishing under an output_severity hook
+# --------------------------------------------------------------------------
+
+POST_TS = 1_700_000_000.5
+
+
+class _PvSpy:
+    """A real SharedPV that also logs every post into a shared event list."""
+
+    def __init__(self, name: str, initial, events: list, *, fail: bool = False) -> None:
+        self.name = name
+        self.events = events
+        self.fail = fail
+        self.shared = SharedPV(initial=initial)
+
+    def post(self, value) -> None:
+        if self.fail:
+            raise RuntimeError(f"post of {self.name} refused")
+        self.events.append(("post", self.name, _alarm(value), value.changedSet()))
+        self.shared.post(value)
+
+    def current(self):
+        return self.shared.current()
+
+
+class _CaSpy:
+    """Records the pcaspy driver calls ``_post_outputs`` makes, in order."""
+
+    def __init__(self, events: list, *, fail_set: tuple = (), fail_update: bool = False) -> None:
+        self.events = events
+        self.fail_set = fail_set
+        self.fail_update = fail_update
+
+    def setParam(self, reason, value, timestamp=None) -> None:
+        if reason in self.fail_set:
+            raise RuntimeError(f"setParam of {reason} refused")
+        self.events.append(("setParam", reason, value))
+
+    def setParamStatus(self, reason, alarm, severity) -> None:
+        self.events.append(("setParamStatus", reason, alarm, severity))
+
+    def updatePVs(self) -> None:
+        if self.fail_update:
+            raise RuntimeError("updatePVs refused")
+        self.events.append(("updatePVs",))
+
+
+def _ca(name: str) -> str:
+    return f"CA_{name}"
+
+
+def _post_runner(model: MixedModel, events: list, **ca_kwargs) -> Runner:
+    """A server-free runner serving every MixedModel variable on a spied PVA
+    SharedPV and a recording CA driver, requesting the whole roster."""
+    runner = Runner.__new__(Runner)
+    runner.model = model
+    runner.pv_handlers = {}
+    runner.types = {}
+    for name, var in model.supported_variables.items():
+        handler = find_variable_handler(type(var))
+        runner.pv_handlers[name] = handler
+        runner.types[name] = handler.create_type(var)
+    runner.pvs = {
+        name: _PvSpy(name, runner._generate_value(name, None), events)
+        for name in model.supported_variables
+    }
+    runner.ca_pvs = {name: _ca(name) for name in model.supported_variables}
+    runner.ca_driver = _CaSpy(events, **ca_kwargs)
+    runner._udf = frozenset()
+    runner._cycle_requested_names = tuple(model.supported_variables)
+    hook = getattr(model, "output_severity", None)
+    if hook is not None:
+
+        def logged(names):
+            events.append(("hook", list(names)))
+            return hook(names)
+
+        model.output_severity = logged
+    return runner
+
+
+def _trigger(model: MixedModel) -> dict:
+    """Drive the model to the severity trigger; return a whole-roster get."""
+    model.set({MIXED_FLOAT_IN: MIXED_SEVERITY_TRIGGER})
+    return model.get(list(model.supported_variables))
+
+
+def _posts(events: list) -> dict:
+    return {e[1]: e[2] for e in events if e[0] == "post"}
+
+
+def _set_params(events: list) -> list:
+    return [e[1] for e in events if e[0] == "setParam"]
+
+
+def _ca_calls(events: list) -> list:
+    return [e for e in events if e[0] in ("setParam", "setParamStatus", "updatePVs")]
+
+
+def test_post_outputs_requested_names_class_default_is_empty() -> None:
+    assert Runner.__new__(Runner)._cycle_requested_names == ()
+
+
+def test_post_outputs_sees_the_names_run_cycle_requested() -> None:
+    events: list = []
+    seen: list = []
+    runner = _wide_cycle_runner(events, runner_cls=_NarrowRunner)
+    runner._post_outputs = lambda out_values, ts: seen.append(runner._cycle_requested_names)
+
+    runner._run_cycle(_item({IN_X: _write(1.0, 4.0)}))
+
+    assert seen == [(IN_X, OUT_Z)]
+
+
+def test_post_outputs_without_a_hook_posts_as_0_1_4() -> None:
+    """No hook: every Value is ``_generate_value``'s (no forced alarm pair), one
+    setParam per name, one updatePVs, no setParamStatus, and ``_udf`` stays empty."""
+    events: list = []
+    model = MixedModel()
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+    expected = {name: runner._generate_value(name, value, POST_TS) for name, value in out.items()}
+
+    runner._post_outputs(out, POST_TS)
+
+    posts = [e for e in events if e[0] == "post"]
+    assert [p[1] for p in posts] == list(out)
+    for _, name, pair, changed in posts:
+        assert pair == _alarm(expected[name])
+        assert changed == expected[name].changedSet()
+    # the range rule still holds for the out-of-range float output
+    assert _posts(events)[MIXED_FLOAT_OUT] == (2, 2)
+    assert _ca_calls(events)[-1] == ("updatePVs",)
+    assert _set_params(events) == [_ca(n) for n in out]
+    assert not [e for e in events if e[0] == "setParamStatus"]
+    assert runner._udf == frozenset()
+
+
+def test_post_outputs_without_a_hook_ignores_an_extra_key_as_0_1_4() -> None:
+    """A hook-less model whose ``_get`` adds an unserved, wrongly typed key
+    publishes exactly what the same model without the key publishes."""
+    plain_events: list = []
+    extra_events: list = []
+    plain = MixedModel()
+    extra = MixedModel(extra_key=True)
+    plain_runner = _post_runner(plain, plain_events)
+    extra_runner = _post_runner(extra, extra_events)
+    extra_out = _trigger(extra)
+    assert MIXED_EXTRA_KEY in extra_out
+
+    plain_runner._post_outputs(_trigger(plain), POST_TS)
+    extra_runner._post_outputs(extra_out, POST_TS)
+
+    assert extra_events == plain_events
+    assert extra_runner._udf == frozenset()
+
+
+def test_post_outputs_calls_the_hook_once_with_the_cycle_names_before_posting() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+
+    runner._post_outputs(out, POST_TS)
+
+    hooks = [e for e in events if e[0] == "hook"]
+    assert hooks == [("hook", list(model.supported_variables))]
+    assert events[0][0] == "hook"
+
+
+def test_post_outputs_udf_names_carry_invalid_udf_on_both_transports() -> None:
+    import pcaspy
+
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert posts[MIXED_FLOAT_OUT] == (3, 6)
+    assert posts[MIXED_INT] == (3, 6)
+    assert runner.pvs[MIXED_INT].current()["alarm"]["status"] == 6
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+    udf_ca = (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM)
+    ca = _ca_calls(events)
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        # the status directly follows that name's setParam
+        set_at = [c[:2] for c in ca].index(("setParam", _ca(name)))
+        assert ca[set_at + 1] == ("setParamStatus", _ca(name), *udf_ca)
+    assert [c for c in ca if c[0] == "setParamStatus"] == [
+        ("setParamStatus", _ca(MIXED_FLOAT_OUT), *udf_ca),
+        ("setParamStatus", _ca(MIXED_INT), *udf_ca),
+    ]
+    assert ca[-1] == ("updatePVs",)
+    assert ca.count(("updatePVs",)) == 1
+
+
+def test_post_outputs_names_absent_from_the_reply_keep_the_range_rule_or_no_alarm() -> None:
+    """With a hook every post carries an explicit pair: the handler's range
+    rule where it marked one, (0, 0) where it marked none."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF, udf_names=(MIXED_INT,))
+    runner = _post_runner(model, events)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert posts[MIXED_INT] == (3, 6)
+    assert posts[MIXED_FLOAT_OUT] == (2, 2)  # -15.0, outside value_range
+    assert posts[MIXED_FLOAT_IN] == (0, 0)  # inside value_range
+    for name in (MIXED_BOOL, MIXED_STR, MIXED_ENUM):
+        assert posts[name] == (0, 0)
+    changed = {e[1]: e[3] for e in events if e[0] == "post"}
+    for name in model.supported_variables:
+        assert {"alarm.severity", "alarm.status"} <= changed[name], name
+
+
+def test_post_outputs_recovered_udf_names_leave_invalid() -> None:
+    """The explicit pair on the next post clears a stored (3, 6); ``_udf``
+    empties; CA recovers through setParam with no setParamStatus."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    runner._post_outputs(_trigger(model), POST_TS)
+    assert _alarm(runner.pvs[MIXED_INT].current()) == (3, 6)
+
+    events.clear()
+    model.set({MIXED_FLOAT_IN: 2.0})
+    runner._post_outputs(model.get(list(model.supported_variables)), POST_TS + 1)
+
+    assert _alarm(runner.pvs[MIXED_INT].current()) == (0, 0)
+    assert _alarm(runner.pvs[MIXED_FLOAT_OUT].current()) == (0, 0)
+    assert runner._udf == frozenset()
+    assert not [e for e in events if e[0] == "setParamStatus"]
+
+
+def test_post_outputs_a_name_the_cycle_did_not_read_keeps_its_udf_state() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    runner._udf = frozenset({MIXED_STR, MIXED_INT})
+    runner._cycle_requested_names = (MIXED_FLOAT_IN, MIXED_INT)
+    model.set({MIXED_FLOAT_IN: 2.0})
+
+    runner._post_outputs(model.get([MIXED_FLOAT_IN, MIXED_INT]), POST_TS)
+
+    # MIXED_INT was read and reported clean; MIXED_STR was not read at all.
+    assert runner._udf == frozenset({MIXED_STR})
+    assert set(_posts(events)) == {MIXED_FLOAT_IN, MIXED_INT}
+
+
+def test_post_outputs_an_extra_key_never_reaches_the_hook_udf_or_phase_1() -> None:
+    """An unserved extra key and a served but unrequested one, both wrongly
+    typed: neither is shown to the hook, posted, converted or put in ``_udf``."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF, extra_key=True)
+    runner = _post_runner(model, events)
+    requested = [n for n in model.supported_variables if n != MIXED_BOOL]
+    runner._cycle_requested_names = tuple(requested)
+    model.set({MIXED_FLOAT_IN: MIXED_SEVERITY_TRIGGER})
+    out = model.get(requested)
+    assert MIXED_EXTRA_KEY in out
+    out[MIXED_BOOL] = object()
+
+    runner._post_outputs(out, POST_TS)
+
+    assert [e for e in events if e[0] == "hook"] == [("hook", requested)]
+    assert set(_posts(events)) == set(requested)
+    assert _ca(MIXED_BOOL) not in _set_params(events)
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+
+@pytest.mark.parametrize(
+    "fail_mode, error",
+    [
+        pytest.param(FAIL_RAISE, RuntimeError, id="hook-raises"),
+        pytest.param(FAIL_MALFORMED, ValueError, id="unknown-condition"),
+    ],
+)
+def test_post_outputs_a_failing_severity_hook_posts_nothing(fail_mode: str, error: type) -> None:
+    events: list = []
+    model = MixedModel(fail_mode=fail_mode)
+    runner = _post_runner(model, events)
+    runner._udf = frozenset({MIXED_STR})
+
+    with pytest.raises(error):
+        runner._post_outputs(_trigger(model), POST_TS)
+
+    assert [e[0] for e in events] == ["hook"]
+    assert runner._udf == frozenset({MIXED_STR})
+
+
+def test_post_outputs_a_ca_conversion_error_in_phase_1_posts_nothing() -> None:
+    """An enum value outside its options fails ``value_to_native`` in phase 1:
+    no PVA post happens either, unlike 0.1.4's partial set."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+    out[MIXED_ENUM] = "NOT-AN-OPTION"
+
+    with pytest.raises(Exception):
+        runner._post_outputs(out, POST_TS)
+
+    assert [e[0] for e in events] == ["hook"]
+    assert runner._udf == frozenset()
+
+
+def _pack_failing_for(runner: Runner, bad: str) -> None:
+    original = runner._pack_value
+
+    def pack(pv, value, ts=None):
+        if pv == bad:
+            raise RuntimeError(f"cannot pack {pv}")
+        return original(pv, value, ts)
+
+    runner._pack_value = pack
+
+
+def test_post_outputs_a_pack_error_on_a_non_udf_name_skips_only_its_pva_post() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    _pack_failing_for(runner, MIXED_BOOL)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert MIXED_BOOL not in posts
+    assert posts[MIXED_INT] == (3, 6)
+    # its CA value is still written
+    assert _ca(MIXED_BOOL) in _set_params(events)
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+
+def test_post_outputs_a_pack_error_on_a_udf_name_fails_phase_1() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    _pack_failing_for(runner, MIXED_INT)
+
+    with pytest.raises(RuntimeError, match="cannot pack"):
+        runner._post_outputs(_trigger(model), POST_TS)
+
+    assert [e[0] for e in events] == ["hook"]
+    assert runner._udf == frozenset()
+
+
+def test_post_outputs_phase_2_errors_are_logged_per_name_and_never_raise() -> None:
+    import pcaspy
+
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events, fail_set=(_ca(MIXED_FLOAT_OUT),), fail_update=True)
+    runner.pvs[MIXED_INT].fail = True
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    posts = _posts(events)
+    assert MIXED_INT not in posts
+    assert posts[MIXED_FLOAT_OUT] == (3, 6)
+    # the refused setParam skips only that name; the next udf name still gets its status
+    udf_ca = (pcaspy.Alarm.UDF_ALARM, pcaspy.Severity.INVALID_ALARM)
+    assert ("setParamStatus", _ca(MIXED_INT), *udf_ca) in events
+    assert ("setParamStatus", _ca(MIXED_FLOAT_OUT), *udf_ca) not in events
+    assert runner._udf == frozenset({MIXED_FLOAT_OUT, MIXED_INT})
+
+
+def test_post_outputs_with_a_hook_skips_a_none_value() -> None:
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _post_runner(model, events)
+    out = _trigger(model)
+    out[MIXED_STR] = None
+
+    runner._post_outputs(out, POST_TS)
+
+    assert MIXED_STR not in _posts(events)
+    assert _ca(MIXED_STR) not in _set_params(events)
+    assert ("hook", list(out)) in events
+
+
+def test_post_outputs_a_udf_failure_rolls_the_cycle_back_and_completes_puts() -> None:
+    """A phase-1 failure takes ``_run_cycle``'s existing error path: rollback,
+    and every done callback receives the error."""
+    completions: list = []
+    rolled_back: list = []
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_MALFORMED)
+    runner = _post_runner(model, events)
+    runner.queue = Queue()
+    runner.update_rate = 0.0
+    runner._cached_state = {}
+    runner._reset_to_cached_state = lambda: rolled_back.append(True)
+
+    runner._run_cycle(
+        _item({MIXED_FLOAT_IN: _write(MIXED_SEVERITY_TRIGGER, 4.0)}, done=completions.append)
+    )
+
+    assert rolled_back == [True]
+    assert len(completions) == 1 and "no-such-condition" in completions[0]
+    assert [e[0] for e in events] == ["hook"]

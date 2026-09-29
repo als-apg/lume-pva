@@ -34,7 +34,8 @@ from lume_pva_apg.tests._requires import optional_module, skip_if_absent
 # where nothing is served. Guarded so a core-only install skips this file rather
 # than failing collection, which would take the whole suite with it.
 try:
-    from p4p import Type
+    from p4p import Type, Value
+    from p4p.nt import NTEnum, NTNDArray, NTScalar
 
     from lume_pva_apg.epics import epicsAlarmSeverity, epicsAlarmStatus
     from lume_pva_apg.variables import (
@@ -212,6 +213,67 @@ def test_torch_array_roundtrip(
 def test_valid_p4p_type(variable: Variable) -> None:
     handler = find_variable_handler(type(variable))
     assert isinstance(handler.create_type(variable), Type)
+
+
+@pytest.mark.parametrize(
+    ("variable", "code"),
+    [
+        pytest.param(IntVariable(name="i"), "i", id="int"),
+        pytest.param(ScalarVariable(name="x"), "d", id="float"),
+    ],
+)
+def test_scalar_type_wire_code(variable: Variable, code: str) -> None:
+    """An int variable is served as an int32 NTScalar, not as a double.
+
+    IntVariable subclasses ScalarVariable, so a handler that tests for the base
+    class first serves every integer variable as a double.
+    """
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    type_ = handler.create_type(variable)
+
+    assert type_["value"] == code
+    assert type_.aspy() == NTScalar.buildType(code, control=True, display=True).aspy()
+    assert "display" in type_.keys()
+    assert "control" in type_.keys()
+
+
+def test_int_variable_pack_unpack_keeps_int() -> None:
+    variable = IntVariable(name="i", value_range=(-3, 9), unit="counts")
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    type_ = handler.create_type(variable)
+
+    packed = handler.pack_value(variable, type_, 7)
+
+    assert packed["value"] == 7
+    assert isinstance(packed["value"], int)
+    assert packed.display.limitLow == -3
+    assert packed.display.limitHigh == 9
+    assert packed.control.limitLow == -3
+    assert packed.control.limitHigh == 9
+    assert packed.display.units == "counts"
+    assert packed.alarm.severity == int(epicsAlarmSeverity.NO_ALARM)
+
+    unpacked = handler.unpack_value(variable, packed)
+
+    assert unpacked == 7
+    assert type(unpacked) is int
+    variable.validate_value(unpacked)
+
+
+def test_int_variable_unpacks_client_put() -> None:
+    """A value a PVA client writes to an int PV unpacks to an accepted int."""
+    variable = IntVariable(name="i", value_range=(-4, 4))
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    put = Value(handler.create_type(variable), {"value": -2})
+
+    unpacked = handler.unpack_value(variable, put)
+
+    assert unpacked == -2
+    assert type(unpacked) is int
+    variable.validate_value(unpacked)
 
 
 # timestamp?  display/controls metadata mismatched?
@@ -863,3 +925,308 @@ def test_should_resolve_handler_for_variable_subclasses(
 
     assert isinstance(handler, expected_handler_type)
     assert isinstance(handler, VariableHandler)
+
+
+# --- Display metadata: the 0.1.5 wire structure of str, bool and enum PVs ----
+
+
+@pytest.mark.parametrize(
+    ("variable", "expected"),
+    [
+        pytest.param(
+            StrVariable(name="s"), lambda: NTScalar.buildType("s", display=True), id="str"
+        ),
+        pytest.param(
+            BoolVariable(name="b"), lambda: NTScalar.buildType("?", display=True), id="bool"
+        ),
+        pytest.param(
+            EnumVariable(name="e", options=["A", "B"]),
+            lambda: NTEnum.buildType(display=True),
+            id="enum",
+        ),
+    ],
+)
+def test_simple_and_enum_types_carry_display_block(variable: Variable, expected: Callable) -> None:
+    """Str, bool and enum PVs are served with a display block, so a client can read a description."""
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    type_ = handler.create_type(variable)
+
+    assert type_.aspy() == expected().aspy()
+    assert "display" in type_.keys()
+    assert "description" in type_["display"].keys()
+    assert "units" in type_["display"].keys()
+
+
+def test_simple_scalar_display_has_only_description_and_units() -> None:
+    """A non-numeric NTScalar display carries description and units, and no limits or format."""
+    type_ = SimpleScalarHandler().create_type(StrVariable(name="s"))
+
+    assert sorted(type_["display"].keys()) == ["description", "units"]
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        pytest.param(ScalarVariable(name="x", unit="mm"), 1.5, id="float"),
+        pytest.param(IntVariable(name="i", unit="counts"), 3, id="int"),
+        pytest.param(StrVariable(name="s"), "hello", id="str"),
+        pytest.param(BoolVariable(name="b"), True, id="bool"),
+        pytest.param(EnumVariable(name="e", options=["A", "B"]), "B", id="enum"),
+    ],
+)
+def test_set_display_metadata_writes_description(variable: Variable, value: Any) -> None:
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    packed = handler.pack_value(variable, handler.create_type(variable), value)
+
+    handler.set_display_metadata(variable, packed, description="Beam energy")
+
+    assert packed["display"]["description"] == "Beam energy"
+
+
+@pytest.mark.parametrize("description", [None, ""], ids=["none", "empty"])
+@pytest.mark.parametrize(
+    "variable",
+    [
+        pytest.param(ScalarVariable(name="x"), id="float"),
+        pytest.param(StrVariable(name="s"), id="str"),
+        pytest.param(EnumVariable(name="e", options=["A", "B"]), id="enum"),
+    ],
+)
+def test_set_display_metadata_leaves_description_unset_when_absent(
+    variable: Variable, description: str | None
+) -> None:
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    packed = handler.pack_value(variable, handler.create_type(variable), None)
+
+    handler.set_display_metadata(variable, packed, description=description)
+
+    assert packed["display"]["description"] == ""
+    assert "display.description" not in packed.changedSet()
+
+
+def test_set_display_metadata_defaults_to_no_description() -> None:
+    variable = StrVariable(name="s")
+    handler = SimpleScalarHandler()
+    packed = handler.pack_value(variable, handler.create_type(variable), "a")
+
+    handler.set_display_metadata(variable, packed)
+
+    assert packed["display"]["description"] == ""
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        pytest.param(ScalarVariable(name="x", unit="mm"), 1.5, id="float"),
+        pytest.param(IntVariable(name="i", unit="counts"), 3, id="int"),
+    ],
+)
+def test_set_display_metadata_writes_units_when_variable_has_one(
+    variable: Variable, value: Any
+) -> None:
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    type_ = handler.create_type(variable)
+    fresh = Value(type_, {"value": value})
+
+    handler.set_display_metadata(variable, fresh)
+
+    assert fresh["display"]["units"] == variable.unit
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        pytest.param(StrVariable(name="s"), "hello", id="str"),
+        pytest.param(BoolVariable(name="b"), False, id="bool"),
+        pytest.param(EnumVariable(name="e", options=["A", "B"]), "A", id="enum"),
+        pytest.param(ScalarVariable(name="x"), 1.0, id="float-no-unit"),
+    ],
+)
+def test_set_display_metadata_skips_units_without_a_unit(variable: Variable, value: Any) -> None:
+    """Str, bool and enum variables have no unit field; a missing or empty unit writes nothing."""
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    packed = handler.pack_value(variable, handler.create_type(variable), value)
+
+    handler.set_display_metadata(variable, packed, description="d")
+
+    assert packed["display"]["units"] == ""
+
+
+def test_set_display_metadata_does_not_collide_with_scalar_set_metadata() -> None:
+    """The static ScalarVariableHandler.set_metadata that the torch handler calls keeps its signature."""
+    assert isinstance(ScalarVariableHandler.__dict__["set_metadata"], staticmethod)
+    assert "set_display_metadata" in VariableHandler.__dict__
+    assert "set_display_metadata" not in ScalarVariableHandler.__dict__
+
+
+def test_nd_type_is_untouched_by_display_metadata() -> None:
+    variable = NDVariable(name="nd", shape=(2, 2), dtype=np.float64)
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    type_ = handler.create_type(variable)
+    packed = handler.pack_value(variable, type_, np.zeros((2, 2)))
+
+    assert type_.aspy() == NTNDArray.buildType().aspy()
+    assert "display" not in type_.keys()
+    assert "display" not in packed.keys()
+
+
+@pytest.mark.skipif(not TORCH_INSTALLED, reason="needs the torch extra")
+def test_torch_scalar_type_is_untouched_by_display_metadata() -> None:
+    variable = TorchScalarVariable(name="ts")
+    handler = find_variable_handler(type(variable))
+    assert isinstance(handler, TorchScalarVariableHandler)
+
+    type_ = handler.create_type(variable)
+    packed = handler.pack_value(variable, type_, 2.0)
+
+    assert type_.aspy() == NTScalar.buildType("d", control=True, display=True).aspy()
+    assert packed["display"]["description"] == ""
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        pytest.param(StrVariable(name="s"), id="str"),
+        pytest.param(BoolVariable(name="b"), id="bool"),
+        pytest.param(EnumVariable(name="e", options=["A", "B"]), id="enum"),
+    ],
+)
+def test_one_argument_create_type_and_ca_pvspec_still_work(variable: Variable) -> None:
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    assert isinstance(handler.create_type(variable), Type)
+    assert isinstance(handler.ca_pvspec(variable), dict)
+
+
+def test_float_with_precision_type_carries_display_precision() -> None:
+    variable = ScalarVariable(name="x", unit="mm", value_range=(0.0, 10.0))
+    handler = find_variable_handler(type(variable))
+    assert isinstance(handler, ScalarVariableHandler)
+
+    type_ = handler.create_type(variable, precision=3)
+
+    assert type_.aspy() == NTScalar.buildType("d", control=True, display=True, form=True).aspy()
+    display_keys = type_["display"].keys()
+    assert "precision" in display_keys
+    assert "form" in display_keys
+    assert "format" not in display_keys
+
+
+def test_float_with_precision_type_packs_and_holds_precision() -> None:
+    """A form=True type still packs through the unchanged pack_value and set_metadata."""
+    variable = ScalarVariable(name="x", unit="mm", value_range=(0.0, 10.0))
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    packed = handler.pack_value(variable, handler.create_type(variable, precision=3), 1.5)
+    packed["display"]["precision"] = 3
+
+    assert packed["value"] == 1.5
+    assert packed["display"]["units"] == "mm"
+    assert packed["display"]["precision"] == 3
+
+
+def test_float_with_zero_precision_still_builds_form_type() -> None:
+    """precision=0 is a real precision, not an absent one."""
+    variable = ScalarVariable(name="x")
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    type_ = handler.create_type(variable, precision=0)
+
+    assert "precision" in type_["display"].keys()
+    assert handler.ca_pvspec(variable, precision=0)["prec"] == 0
+
+
+def test_float_with_precision_ca_pvspec_adds_prec() -> None:
+    variable = ScalarVariable(name="x", unit="mm", value_range=(0.0, 10.0))
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    assert handler.ca_pvspec(variable, precision=3) == {
+        "unit": "mm",
+        "type": "float",
+        "lolim": 0.0,
+        "hilim": 10.0,
+        "prec": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    ("variable", "code", "type_name"),
+    [
+        pytest.param(
+            ScalarVariable(name="x", unit="mm", value_range=(0.0, 10.0)), "d", "float", id="float"
+        ),
+        pytest.param(IntVariable(name="i", unit="ct", value_range=(0, 10)), "i", "int", id="int"),
+    ],
+)
+def test_without_precision_type_and_pvspec_are_unchanged(
+    variable: Variable, code: str, type_name: str
+) -> None:
+    """precision=None (explicit or omitted) reproduces 0.1.4's type and pvspec exactly."""
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+    expected_type = NTScalar.buildType(code, control=True, display=True).aspy()
+    expected_spec = {
+        "unit": variable.unit,
+        "type": type_name,
+        "lolim": variable.value_range[0],
+        "hilim": variable.value_range[1],
+    }
+
+    for kwargs in ({}, {"precision": None}):
+        type_ = handler.create_type(variable, **kwargs)
+        assert type_.aspy() == expected_type
+        assert "precision" not in type_["display"].keys()
+        assert "format" in type_["display"].keys()
+        assert handler.ca_pvspec(variable, **kwargs) == expected_spec
+
+
+def test_precision_is_keyword_only() -> None:
+    variable = ScalarVariable(name="x")
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    with pytest.raises(TypeError):
+        handler.create_type(variable, 3)  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        handler.ca_pvspec(variable, 3)  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        pytest.param(StrVariable(name="s"), id="str"),
+        pytest.param(BoolVariable(name="b"), id="bool"),
+        pytest.param(EnumVariable(name="e", options=["A", "B"]), id="enum"),
+        pytest.param(NDVariable(name="nd", shape=(2,), dtype=np.float64), id="nd"),
+    ],
+)
+def test_other_handlers_take_no_precision_keyword(variable: Variable) -> None:
+    handler = find_variable_handler(type(variable))
+    assert handler is not None
+
+    with pytest.raises(TypeError):
+        handler.create_type(variable, precision=3)  # type: ignore[call-arg]
+
+
+@pytest.mark.skipif(not TORCH_INSTALLED, reason="needs the torch extra")
+def test_torch_scalar_handler_takes_no_precision_keyword() -> None:
+    variable = TorchScalarVariable(name="ts")
+    handler = find_variable_handler(type(variable))
+    assert isinstance(handler, TorchScalarVariableHandler)
+
+    with pytest.raises(TypeError):
+        handler.create_type(variable, precision=3)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        handler.ca_pvspec(variable, precision=3)  # type: ignore[call-arg]

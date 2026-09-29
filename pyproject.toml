@@ -52,9 +52,12 @@ dynamic = ["version"]
 ca = [
     "pcaspy>=0.8.1",
 ]
-# PVAccess serving and the NormativeTypes value layer.
+# PVAccess serving and the NormativeTypes value layer. 4.2.2 is the floor: it
+# is the only release on which the runner's use of `form=True` has been
+# verified, and it is the version OSPREY deployments lock. A lower bound
+# rather than a pin, so consumers stay free to take later releases.
 pva = [
-    "p4p",
+    "p4p>=4.2.2",
 ]
 torch = [
     "torch",
