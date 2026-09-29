@@ -236,6 +236,31 @@ class VariableHandler(ABC, Generic[VariableT]):
         """
         return {}
 
+    def set_display_metadata(
+        self, variable: VariableT, v: Value, *, description: str | None = None
+    ) -> None:
+        """
+        Writes the display metadata of a packed value: the variable's unit and a description.
+
+        Only fields with something to say are written. A variable without a ``unit``
+        attribute (str, bool and enum variables have none), or with an empty one, leaves
+        ``display.units`` alone, and so does a ``None`` or empty description for
+        ``display.description``. The value's type must carry a display block.
+
+        Parameters
+        ----------
+        variable : Variable
+            The variable the value was packed for
+        v : Value
+            The packed value to annotate, modified in place
+        description : str | None
+            The description to publish, or None to leave it unset
+        """
+        if unit := getattr(variable, "unit", None):
+            v["display"]["units"] = unit
+        if description:
+            v["display"]["description"] = description
+
 
 class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable]):
     """Variable handler for LUME ScalarVariable, and the TorchScalarVariable type"""
@@ -272,12 +297,31 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable]):
                 v["alarm"]["severity"] = int(epicsAlarmSeverity.NO_ALARM)
                 v["alarm"]["status"] = int(epicsAlarmStatus.NO_STATUS)
 
-    def create_type(self, variable: ScalarVariable | IntVariable) -> Type:
+    def create_type(
+        self, variable: ScalarVariable | IntVariable, *, precision: int | None = None
+    ) -> Type:
+        """Build the NTScalar type for ``variable``.
+
+        Parameters
+        ----------
+        variable : ScalarVariable | IntVariable
+            The variable to build a type for.
+        precision : int | None, optional
+            Display precision. When given, the type is built with ``form=True``
+            so its display block carries ``precision`` (and ``form``, in place of
+            ``format``); the runner writes the value at pack time. ``None`` builds
+            exactly the precision-less type. Validation lives in the runner.
+
+        Returns
+        -------
+        Type
+        """
         # IntVariable subclasses ScalarVariable, so it has to be tested first.
         return NTScalar.buildType(
             "i" if isinstance(variable, IntVariable) else "d",
             control=True,
             display=True,
+            form=precision is not None,
         )
 
     def pack_value(
@@ -328,7 +372,23 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable]):
     ) -> ScalarType:
         return value
 
-    def ca_pvspec(self, variable: ScalarVariable | IntVariable) -> dict:
+    def ca_pvspec(
+        self, variable: ScalarVariable | IntVariable, *, precision: int | None = None
+    ) -> dict:
+        """Return the pcaspy PV spec for ``variable``.
+
+        Parameters
+        ----------
+        variable : ScalarVariable | IntVariable
+            The variable to describe.
+        precision : int | None, optional
+            When given, published as pcaspy's ``prec`` field; ``None`` leaves the
+            spec without a ``prec`` key.
+
+        Returns
+        -------
+        dict
+        """
         value_range = getattr(variable, "value_range", (0, 0))
         value_range = (0, 0) if value_range is None else value_range
         if isinstance(variable, IntVariable):
@@ -351,12 +411,15 @@ class ScalarVariableHandler(VariableHandler[ScalarVariable | IntVariable]):
         # outside it, where PVA reports MAJOR and CA reports nothing: pcaspy's
         # inclusive comparison cannot express a threshold that alarms outside
         # the range without also alarming at it.
-        return {
+        spec = {
             "unit": variable.unit,
             "type": type_,
             "lolim": value_range[0],
             "hilim": value_range[1],
         }
+        if precision is not None:
+            spec["prec"] = precision
+        return spec
 
 
 class NDVariableHandler(VariableHandler[NDVariable | TorchNDVariable]):
@@ -530,7 +593,7 @@ class SimpleScalarHandler(VariableHandler[StrVariable | BoolVariable]):
     """Handler for StrVariable, BoolVariable"""
 
     def create_type(self, variable: StrVariable | BoolVariable):
-        return NTScalar.buildType("s" if isinstance(variable, StrVariable) else "?")
+        return NTScalar.buildType("s" if isinstance(variable, StrVariable) else "?", display=True)
 
     def pack_value(
         self,
@@ -589,7 +652,7 @@ class EnumVariableHandler(VariableHandler):
     """Handler for EnumVariable"""
 
     def create_type(self, variable: EnumVariable) -> Type:
-        return NTEnum.buildType()
+        return NTEnum.buildType(display=True)
 
     def pack_value(self, variable: EnumVariable, type_: Type, value: int | str | None) -> Value:
         if value is None:
