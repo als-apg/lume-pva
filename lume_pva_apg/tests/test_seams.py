@@ -32,6 +32,7 @@ objects that are still alive, which pyepics documents as a route to a random
 SIGSEGV from inside the EPICS libraries.
 """
 
+import functools
 import inspect
 import itertools
 import multiprocessing
@@ -57,6 +58,7 @@ os.environ.setdefault("EPICS_PVA_AUTO_ADDR_LIST", "NO")
 # rather than failing collection, which would take the whole suite with it.
 try:
     import epics
+    import pcaspy
     from lume.model import LUMEModel
     from lume.variables import ScalarVariable
     from p4p.client.thread import Context
@@ -64,6 +66,9 @@ try:
 
     from lume_pva_apg.runner import RESET_CONTROL_PV, Runner
     from lume_pva_apg.tests._mixed_model import (
+        FAIL_MALFORMED,
+        FAIL_RAISE,
+        FAIL_UDF,
         MIXED_BOOL,
         MIXED_DEFAULTS,
         MIXED_ENUM,
@@ -71,6 +76,7 @@ try:
         MIXED_FLOAT_IN,
         MIXED_FLOAT_OUT,
         MIXED_INT,
+        MIXED_SEVERITY_TRIGGER,
         MIXED_STR,
         MixedModel,
     )
@@ -191,11 +197,24 @@ _RUNNERS: dict[str, type[Runner]] = {
     "seam": SeamRunner,
     # The stock runner, serving a MixedModel instead of a SeamModel.
     "mixed": Runner,
+    # The stock runner, serving a MixedModel with output_severity / extra-key knobs.
+    "mixed_udf": Runner,
+    "mixed_udf_int": Runner,
+    "mixed_raise": Runner,
+    "mixed_malformed": Runner,
+    "mixed_extra": Runner,
+    "mixed_udf_extra": Runner,
 }
 
 # The model each runner key serves, where it is not SeamModel.
 _MODELS: dict[str, Callable[[mpEvent], LUMEModel]] = {
     "mixed": MixedModel,
+    "mixed_udf": functools.partial(MixedModel, fail_mode=FAIL_UDF),
+    "mixed_udf_int": functools.partial(MixedModel, fail_mode=FAIL_UDF, udf_names=(MIXED_INT,)),
+    "mixed_raise": functools.partial(MixedModel, fail_mode=FAIL_RAISE),
+    "mixed_malformed": functools.partial(MixedModel, fail_mode=FAIL_MALFORMED),
+    "mixed_extra": functools.partial(MixedModel, extra_key=True),
+    "mixed_udf_extra": functools.partial(MixedModel, fail_mode=FAIL_UDF, extra_key=True),
 }
 
 
@@ -664,3 +683,127 @@ def test_precision_and_description_leave_add_pv_signature_unchanged() -> None:
     ``_pv_meta`` rather than new parameters, so its signature is 0.1.4's."""
     params = list(inspect.signature(Runner._add_pv).parameters)
     assert params == ["self", "pv", "var", "ro", "prefix", "handler"]
+
+
+# --------------------------------------------------------------------------
+# output_severity: an undefined output reaches both transports as INVALID/UDF
+# --------------------------------------------------------------------------
+
+# What a CA client reads for an undefined output: INVALID severity, UDF status.
+CA_UDF = (int(pcaspy.Severity.INVALID_ALARM), int(pcaspy.Alarm.UDF_ALARM))
+# The same on PVA: epicsAlarmSeverity INVALID_ALARM, epicsAlarmStatus UDF_STATUS.
+PVA_UDF = (3, 6)
+
+
+def _pva_alarm(prefix: str, name: str) -> tuple[int, int]:
+    raw = _pva_raw(prefix, name)
+    return raw["alarm"]["severity"], raw["alarm"]["status"]
+
+
+def test_severity_udf_outputs_reach_ca_and_pva_as_invalid_udf(serve) -> None:
+    prefix = serve("mixed_udf")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        assert _severity(f"{prefix}{name}") == CA_UDF, name
+        assert _pva_alarm(prefix, name) == PVA_UDF, name
+    # an undefined name still carries its type-valid value
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(2 * MIXED_SEVERITY_TRIGGER)
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["value"] == pytest.approx(2 * MIXED_SEVERITY_TRIGGER)
+    # a name the hook did not report is untouched
+    assert _severity(f"{prefix}{MIXED_BOOL}") == (0, 0)
+    assert _pva_alarm(prefix, MIXED_BOOL) == (0, 0)
+
+
+def test_severity_recovered_udf_outputs_leave_invalid_on_both_transports(serve) -> None:
+    prefix = serve("mixed_udf")
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+    assert _severity(f"{prefix}{MIXED_INT}") == CA_UDF
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 2.0)
+
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        assert _severity(f"{prefix}{name}") == (0, 0), name
+        assert _pva_alarm(prefix, name) == (0, 0), name
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(4.0)
+
+
+def test_severity_a_name_absent_from_the_reply_keeps_0_1_4_alarms(serve) -> None:
+    """Only the int is reported: the float output, outside its range, keeps the
+    PVA range rule (MAJOR) and CA's no-alarm-threshold behaviour."""
+    prefix = serve("mixed_udf_int")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    assert _severity(f"{prefix}{MIXED_INT}") == CA_UDF
+    assert _pva_alarm(prefix, MIXED_INT) == PVA_UDF
+    assert _pva_alarm(prefix, MIXED_FLOAT_OUT) == (2, 2)
+    assert _severity(f"{prefix}{MIXED_FLOAT_OUT}") == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "runner_key",
+    [
+        pytest.param("mixed_raise", id="hook-raises"),
+        pytest.param("mixed_malformed", id="unknown-condition"),
+    ],
+)
+def test_severity_a_failing_hook_posts_nothing_on_either_transport(serve, runner_key: str) -> None:
+    prefix = serve(runner_key)
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 2.0)
+    before = _pva_raw(prefix, MIXED_FLOAT_OUT)
+    assert before["value"] == pytest.approx(4.0)
+
+    # The cycle fails; the put still completes, with the error.
+    epics.caput(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER, wait=True, timeout=OP_TIMEOUT)
+
+    after = _pva_raw(prefix, MIXED_FLOAT_OUT)
+    assert after["value"] == pytest.approx(4.0)
+    assert after["timeStamp"]["secondsPastEpoch"] == before["timeStamp"]["secondsPastEpoch"]
+    assert after["timeStamp"]["nanoseconds"] == before["timeStamp"]["nanoseconds"]
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(4.0)
+    assert _severity(f"{prefix}{MIXED_INT}") == (0, 0)
+
+    # ...and the next good cycle publishes as usual.
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 1.0)
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(2.0)
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["value"] == pytest.approx(2.0)
+
+
+def test_severity_hookless_model_with_an_extra_key_serves_as_0_1_4(serve) -> None:
+    """No hook: an extra, wrongly typed key from ``_get`` changes nothing, and
+    no name is ever reported undefined."""
+    prefix = serve("mixed_extra")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", 2.0)
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(4.0)
+    assert _pva_raw(prefix, MIXED_FLOAT_OUT)["value"] == pytest.approx(4.0)
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+    assert _pva_alarm(prefix, MIXED_FLOAT_OUT) == (2, 2)
+    assert _severity(f"{prefix}{MIXED_FLOAT_OUT}") == (0, 0)
+    assert _severity(f"{prefix}{MIXED_INT}") == (0, 0)
+    assert _pva_alarm(prefix, MIXED_INT) == (0, 0)
+
+
+def test_severity_an_extra_key_does_not_disturb_the_udf_hook(serve) -> None:
+    prefix = serve("mixed_udf_extra")
+
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    assert _severity(f"{prefix}{MIXED_INT}") == CA_UDF
+    assert _pva_alarm(prefix, MIXED_INT) == PVA_UDF
+    assert _read(f"{prefix}{MIXED_FLOAT_OUT}") == pytest.approx(2 * MIXED_SEVERITY_TRIGGER)
+
+
+def test_severity_a_pva_put_to_a_udf_name_keeps_invalid_udf(serve) -> None:
+    prefix = serve("mixed_udf")
+    _put(f"{prefix}{MIXED_FLOAT_IN}", MIXED_SEVERITY_TRIGGER)
+
+    with Context("pva") as ctx:
+        ctx.put(f"{prefix}{MIXED_INT}", 7, timeout=OP_TIMEOUT, wait=True)
+
+    raw = _pva_raw(prefix, MIXED_INT)
+    assert raw["value"] == 7
+    assert (raw["alarm"]["severity"], raw["alarm"]["status"]) == PVA_UDF
