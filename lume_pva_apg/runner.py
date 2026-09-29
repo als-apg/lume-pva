@@ -217,6 +217,14 @@ class RunnerConfig(TypedDict):
         runner shares its prefix with another server, or when the surrounding
         deployment offers reset through a channel of its own, so the runner
         claims no name the model did not ask for.
+    tick_interval_s : float | None
+        Period in seconds of the runner's own passes: every interval, a pass
+        with no input values is queued, so a model whose outputs move on their
+        own is published without a client write. Absent or None, the default,
+        queues none. At most one such pass is ever waiting in the queue, so a
+        model slower than the interval is never buried under a backlog.
+        Otherwise a finite int or float greater than zero; anything else is
+        rejected with a ValueError.
     """
 
     prefix: str
@@ -227,6 +235,7 @@ class RunnerConfig(TypedDict):
     alarm_on_refused_write: bool
     clamp_writes: bool
     control_pvs: bool
+    tick_interval_s: NotRequired[float | None]
 
 
 class Runner:
@@ -249,6 +258,16 @@ class Runner:
     # severity over these only: ``LUMEModel.get`` validates just the requested
     # names, so any extra key a model's ``_get`` returned is unvalidated.
     _cycle_requested_names: tuple[str, ...] = ()
+    # Periodic-pass state (``tick_interval_s``). ``_tick_pending`` is true while
+    # a tick item sits in the queue, so at most one is ever waiting;
+    # ``_pass_is_tick`` tells a subclass the current pass is a pure tick. The
+    # defaults describe a runner with no ticker, so a Runner built without
+    # __init__ behaves as one that never ticks.
+    _tick_interval_s: float | None = None
+    _tick_pending: bool = False
+    _pass_is_tick: bool = False
+    _ticker: threading.Thread | None = None
+    _ticker_stop: threading.Event | None = None
 
     class Handler:
         """
@@ -430,6 +449,11 @@ class Runner:
         # Must be set before the PVs are built: _add_pv's initial value goes
         # through _generate_value, which reads it.
         self._udf = frozenset()
+        # Tick state exists whether or not tick_interval_s is set, so the queue
+        # and the run loop never have to ask which kind of runner they serve.
+        self._tick_lock = threading.Lock()
+        self._tick_pending = False
+        self._pass_is_tick = False
         # Base name of the reset control PV -- the key it holds in the pvdb, and
         # the reason the CA driver is called back with. Empty when control PVs
         # are suppressed.
@@ -451,6 +475,21 @@ class Runner:
         self.supports_pva = "pva" in self.protos
 
         self.update_rate = config.get("update_rate", 0.1)
+
+        # Checked before any PV is built, so a bad value fails the whole start.
+        # A bool is refused even though it is an int: True reads as "yes, tick",
+        # not as one second.
+        tick_interval_s = config.get("tick_interval_s")
+        if tick_interval_s is not None and (
+            type(tick_interval_s) not in (int, float)
+            or not math.isfinite(tick_interval_s)
+            or tick_interval_s <= 0
+        ):
+            raise ValueError(
+                "tick_interval_s must be a finite number of seconds greater than zero, "
+                f"or None; got {tick_interval_s!r}"
+            )
+        self._tick_interval_s = tick_interval_s
 
         # Write-path policy. Every default here reproduces the behaviour of a
         # runner that sets none of them.
@@ -634,8 +673,26 @@ class Runner:
                 "done": [done] if done is not None else [],
                 "reset": reset,
                 "jobs": list(jobs),
+                "tick": False,
             }
         )
+
+    def _tick(self) -> None:
+        """
+        Queue one periodic pass, unless one is already waiting.
+
+        Called by the ticker thread every ``tick_interval_s``. The pending flag
+        is checked and set under ``_tick_lock``, set before the item is queued,
+        and cleared only by ``_run_cycle`` when it takes the tick off the queue,
+        so a model slower than the interval sees at most one tick waiting. The
+        item is built fresh on every call: the run loop mutates the items it
+        merges, so no two ticks may share one.
+        """
+        with self._tick_lock:
+            if self._tick_pending:
+                return
+            self._tick_pending = True
+            self.queue.put({"values": {}, "done": [], "reset": False, "jobs": [], "tick": True})
 
     def _clamp_write(self, variable: Variable, value: Any) -> Any:
         """
@@ -1050,14 +1107,79 @@ class Runner:
         """Access the underlying config"""
         return self._config
 
+    def _ticker_join_timeout(self) -> float:
+        """Bound on waiting for a stopping ticker: two intervals, never under 5 s."""
+        return max(2 * (self._tick_interval_s or 0.0), 5.0)
+
+    def _start_ticker(self) -> None:
+        """
+        Start the thread that queues a periodic pass every ``tick_interval_s``.
+
+        A no-op without an interval, or while a ticker is running and has not
+        been asked to stop. A ticker that is stopping is joined first, so two
+        never run at once. The pending flag is reset before the new thread
+        starts: an interrupt between a tick's dequeue and its clear would
+        otherwise leave it set, and no later tick would ever be queued.
+
+        The stop event is held in the thread's closure rather than read from
+        ``self``, so a restart that replaces ``_ticker_stop`` cannot leave an
+        old thread waiting on an event nobody will set.
+        """
+        interval = self._tick_interval_s
+        if interval is None:
+            return
+        ticker, stop = self._ticker, self._ticker_stop
+        if ticker is not None and ticker.is_alive():
+            if stop is not None and not stop.is_set():
+                return
+            ticker.join(timeout=self._ticker_join_timeout())
+        with self._tick_lock:
+            self._tick_pending = False
+        stop = threading.Event()
+
+        def tick_loop() -> None:
+            while not stop.wait(interval):
+                self._tick()
+
+        ticker = threading.Thread(target=tick_loop, name="lume-pva-ticker", daemon=True)
+        self._ticker_stop = stop
+        self._ticker = ticker
+        ticker.start()
+
+    def _stop_ticker(self) -> None:
+        """
+        Stop the ticker thread, if there is one, and wait for it to end.
+
+        The references are dropped only once the thread is dead; a thread still
+        alive after the bounded join is logged and kept, so the next
+        :meth:`_start_ticker` sees it stopping and joins it again.
+        """
+        ticker, stop = self._ticker, self._ticker_stop
+        if ticker is None:
+            return
+        if stop is not None:
+            stop.set()
+        ticker.join(timeout=self._ticker_join_timeout())
+        if ticker.is_alive():
+            LOG.warning("tick thread did not stop within its join timeout; leaving it to exit")
+            return
+        self._ticker = None
+        self._ticker_stop = None
+
     def _run(self):
         """
         Runs the simulation, blocks forever.
         Dequeues PV updates from the updater thread, sets values on the model, and updates outputs.
+        The ticker, when ``tick_interval_s`` is set, runs for exactly as long as
+        this loop does, so a second ``run()`` after an interrupt ticks again.
         """
-        while True:
-            # Wait for new data to come in
-            self._run_cycle(self.queue.get())
+        self._start_ticker()
+        try:
+            while True:
+                # Wait for new data to come in
+                self._run_cycle(self.queue.get())
+        finally:
+            self._stop_ticker()
 
     def _run_cycle(self, item: dict) -> None:
         """
@@ -1067,8 +1189,10 @@ class Runner:
         order. Then the model pass runs: snapshot the settable state, reset if
         requested, ``model.set`` the batch's values, read back the variables
         :meth:`_cycle_output_names` lists and publish them. The pass runs only when the batch has something for the
-        model -- values, a reset, or no jobs at all (the empty start-up item
-        publishes the initial outputs). A batch of jobs alone touches the model
+        model -- values, a reset, a tick, or no jobs at all (the empty start-up
+        item publishes the initial outputs). ``_pass_is_tick`` is true only
+        when every item of the batch is a tick and it carries no values and no
+        reset. A batch of jobs alone touches the model
         only through its jobs.
 
         A job owns its operation and its reply, so a job that raises anyway is
@@ -1089,6 +1213,13 @@ class Runner:
         reset_requested: bool = item.get("reset", False)
         jobs: list = item.get("jobs", [])
 
+        # A tick taken off the queue clears the pending flag, so the ticker may
+        # queue the next one; the same holds for every tick merged below.
+        any_tick: bool = item.get("tick", False)
+        all_tick: bool = any_tick
+        if any_tick:
+            self._tick_pending = False
+
         # Wait for a time window of 'update_rate' seconds to pass before
         # continuing, batching whatever else arrives into the same cycle.
         #
@@ -1106,8 +1237,19 @@ class Runner:
                     done_callbacks.extend(next_update["done"])
                     reset_requested = reset_requested or next_update.get("reset", False)
                     jobs.extend(next_update.get("jobs", []))
+                    next_tick = next_update.get("tick", False)
+                    if next_tick:
+                        self._tick_pending = False
+                    any_tick = any_tick or next_tick
+                    all_tick = all_tick and next_tick
                 except Empty:
                     pass
+
+        # A merged tick makes the batch a tick. Only a batch of ticks alone,
+        # with no values and no reset, is a pure tick pass: the subclass signal
+        # is set here, before the jobs run, and holds for the whole cycle.
+        item["tick"] = any_tick
+        self._pass_is_tick = all_tick and not value_data and not reset_requested
 
         for job in jobs:
             try:
@@ -1115,7 +1257,7 @@ class Runner:
             except Exception as exc:
                 LOG.exception(f"Run-loop job failed: ({exc}); continuing the cycle")
 
-        run_pass = bool(value_data) or reset_requested or not jobs
+        run_pass = bool(value_data) or reset_requested or not jobs or any_tick
 
         if run_pass:
             new_values = {}

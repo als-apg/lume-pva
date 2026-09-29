@@ -11,6 +11,7 @@ the constructor rejects binds no port; nothing here starts a server or makes a
 network call.
 """
 
+import threading
 import time
 from queue import Queue
 from types import SimpleNamespace
@@ -221,7 +222,7 @@ def test_control_pvs_create_pva_sharedpvs_when_pva_enabled() -> None:
 # --------------------------------------------------------------------------
 
 
-QUEUE_ITEM_KEYS = {"values", "done", "reset", "jobs"}
+QUEUE_ITEM_KEYS = {"values", "done", "reset", "jobs", "tick"}
 
 
 def _queue_owner() -> SimpleNamespace:
@@ -257,6 +258,7 @@ def test_an_item_enqueued_with_jobs_carries_them_in_order() -> None:
 
     item = _only_item(owner.queue)
     assert set(item) == QUEUE_ITEM_KEYS
+    assert item["tick"] is False
     assert item["jobs"] == [first, second]
     assert calls == []
 
@@ -272,6 +274,8 @@ def test_an_item_enqueued_without_jobs_carries_an_empty_list() -> None:
     one = owner.queue.get_nowait()
     two = owner.queue.get_nowait()
     assert set(one) == QUEUE_ITEM_KEYS
+    assert set(two) == QUEUE_ITEM_KEYS
+    assert one["tick"] is False and two["tick"] is False
     assert one["jobs"] == []
     assert two["jobs"] == []
     assert one["jobs"] is not two["jobs"]
@@ -313,7 +317,7 @@ def test_jobs_travel_alongside_values_done_and_reset() -> None:
     Runner._enqueue(owner, values, done=done, reset=True, jobs=[job])
 
     item = _only_item(owner.queue)
-    assert item == {"values": values, "done": [done], "reset": True, "jobs": [job]}
+    assert item == {"values": values, "done": [done], "reset": True, "jobs": [job], "tick": False}
 
 
 class _QueueRecordingDriver(Runner.CaDriver):
@@ -332,6 +336,312 @@ class _QueueRecordingDriver(Runner.CaDriver):
 
     def callbackPV(self, reason) -> None:
         pass
+
+
+# --------------------------------------------------------------------------
+# tick_interval_s: validation, state and the tick item
+# --------------------------------------------------------------------------
+
+
+def _bare_runner(monkeypatch: pytest.MonkeyPatch, **config_keys: object) -> Runner:
+    """A real ``Runner.__init__`` over a model with no variables and no server.
+
+    PVA only, no control PVs, and the p4p server replaced, so nothing binds a
+    port; the start-up ``_enqueue({})`` still lands on the real queue.
+    """
+    import p4p.server
+
+    monkeypatch.setattr(p4p.server, "Server", lambda *args, **kwargs: None)
+    monkeypatch.setenv("EPICS_CA_MAX_ARRAY_BYTES", "80000000")
+    empty = StubModel({})
+    config = Runner.generate_config(empty)
+    config.update(protocol=["pva"], control_pvs=False, **config_keys)
+    return Runner(model=empty, config=config)
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("-inf"), id="minus-inf"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param(0, id="zero"),
+        pytest.param(0.0, id="zero-float"),
+        pytest.param(-1, id="minus-one"),
+        pytest.param("1.0", id="string"),
+        pytest.param(np.float64(1.0), id="numpy-float"),
+    ],
+)
+def test_an_invalid_tick_interval_is_rejected_naming_the_key(
+    monkeypatch: pytest.MonkeyPatch, interval: object
+) -> None:
+    with pytest.raises(ValueError, match="tick_interval_s"):
+        _bare_runner(monkeypatch, tick_interval_s=interval)
+
+
+@pytest.mark.parametrize("interval", [pytest.param(1, id="int"), pytest.param(0.25, id="float")])
+def test_a_valid_tick_interval_is_stored(monkeypatch: pytest.MonkeyPatch, interval: float) -> None:
+    runner = _bare_runner(monkeypatch, tick_interval_s=interval)
+
+    assert runner._tick_interval_s == interval
+    assert runner._tick_pending is False
+    assert runner._ticker is None
+
+
+@pytest.mark.parametrize(
+    "config_keys",
+    [pytest.param({}, id="absent"), pytest.param({"tick_interval_s": None}, id="none")],
+)
+def test_tick_state_exists_without_a_tick_interval(
+    monkeypatch: pytest.MonkeyPatch, config_keys: dict
+) -> None:
+    runner = _bare_runner(monkeypatch, **config_keys)
+
+    assert runner._tick_interval_s is None
+    assert runner._tick_pending is False
+    assert runner._pass_is_tick is False
+    assert runner._ticker is None
+    assert runner._ticker_stop is None
+    assert isinstance(runner._tick_lock, type(threading.Lock()))
+    startup = runner.queue.get_nowait()
+    assert startup["tick"] is False
+    assert runner.queue.empty()
+
+
+def test_tick_defaults_exist_on_a_runner_built_without_init() -> None:
+    runner = Runner.__new__(Runner)
+
+    assert runner._tick_interval_s is None
+    assert runner._tick_pending is False
+    assert runner._pass_is_tick is False
+    assert runner._ticker is None
+    assert runner._ticker_stop is None
+
+
+def _tick_owner() -> SimpleNamespace:
+    """The only state ``_tick`` touches: the queue, the lock and the flag."""
+    return SimpleNamespace(queue=Queue(), _tick_lock=threading.Lock(), _tick_pending=False)
+
+
+def test_a_tick_queues_a_tick_item_and_sets_the_pending_flag() -> None:
+    owner = _tick_owner()
+
+    Runner._tick(owner)
+
+    item = _only_item(owner.queue)
+    assert item == {"values": {}, "done": [], "reset": False, "jobs": [], "tick": True}
+    assert set(item) == QUEUE_ITEM_KEYS
+    assert owner._tick_pending is True
+
+
+def test_two_ticks_queue_one_tick_item() -> None:
+    """A tick already waiting absorbs the next: a slow model never builds a backlog."""
+    owner = _tick_owner()
+
+    Runner._tick(owner)
+    Runner._tick(owner)
+
+    item = _only_item(owner.queue)
+    assert item["tick"] is True
+
+
+def test_each_tick_item_is_a_new_dict() -> None:
+    """The run loop mutates the items it merges, so no two ticks may share one."""
+    owner = _tick_owner()
+
+    Runner._tick(owner)
+    first = owner.queue.get_nowait()
+    owner._tick_pending = False
+    Runner._tick(owner)
+    second = owner.queue.get_nowait()
+
+    assert first == second
+    assert first is not second
+    for key in ("values", "done", "jobs"):
+        assert first[key] is not second[key]
+
+
+def test_concurrent_ticks_queue_one_tick_item() -> None:
+    owner = _tick_owner()
+    threads = [threading.Thread(target=Runner._tick, args=(owner,)) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    item = _only_item(owner.queue)
+    assert item["tick"] is True
+
+
+TICK_S = 0.05
+
+
+def _wait_until(condition, deadline_s: float = 5.0) -> bool:
+    """Poll ``condition`` until it holds or ``deadline_s`` passes."""
+    deadline = time.monotonic() + deadline_s
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.005)
+    return True
+
+
+def _counting_ticks(runner: Runner) -> list[int]:
+    """Count the ticker's calls to ``_tick``; the real ``_tick`` still runs."""
+    calls = [0]
+    real_tick = runner._tick
+
+    def tick() -> None:
+        calls[0] += 1
+        real_tick()
+
+    runner._tick = tick
+    return calls
+
+
+def test_a_real_ticker_coalesces_ticks_with_no_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing drains the queue, so every tick after the first finds one pending."""
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+    calls = _counting_ticks(runner)
+
+    runner._start_ticker()
+    try:
+        ticker = runner._ticker
+        assert ticker is not None and ticker.daemon and ticker.is_alive()
+        assert _wait_until(lambda: runner.queue.qsize() >= 2), "no tick within 5 s"
+        seen = calls[0]
+        assert _wait_until(lambda: calls[0] >= seen + 5), "the ticker stopped ticking"
+    finally:
+        runner._stop_ticker()
+
+    items = []
+    while not runner.queue.empty():
+        items.append(runner.queue.get_nowait())
+    assert len(items) == 2
+    assert [item["tick"] for item in items] == [False, True]
+    assert runner._tick_pending is True
+    assert not ticker.is_alive()
+    assert runner._ticker is None
+    assert runner._ticker_stop is None
+
+
+def test_starting_the_ticker_resets_a_stuck_pending_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt between a tick's dequeue and its clear must not wedge the next run."""
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+    runner.queue.get_nowait()  # the start-up item
+    runner._tick_pending = True
+
+    runner._start_ticker()
+    try:
+        ticker = runner._ticker
+        assert _wait_until(lambda: not runner.queue.empty()), "no tick within 5 s"
+    finally:
+        runner._stop_ticker()
+
+    assert runner.queue.get_nowait()["tick"] is True
+    assert not ticker.is_alive()
+
+
+def test_starting_a_running_ticker_again_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+
+    runner._start_ticker()
+    try:
+        ticker, stop = runner._ticker, runner._ticker_stop
+        runner._tick_pending = True
+        runner._start_ticker()
+        assert runner._ticker is ticker
+        assert runner._ticker_stop is stop
+        assert runner._tick_pending is True
+    finally:
+        runner._stop_ticker()
+    assert not ticker.is_alive()
+
+
+def test_a_stopped_ticker_can_be_started_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+
+    runner._start_ticker()
+    first = runner._ticker
+    runner._stop_ticker()
+    runner._start_ticker()
+    try:
+        second = runner._ticker
+        assert second is not None and second is not first
+        assert second.is_alive()
+        assert runner._ticker_stop is not None and not runner._ticker_stop.is_set()
+    finally:
+        runner._stop_ticker()
+    assert not first.is_alive() and not second.is_alive()
+
+
+def test_a_ticker_still_alive_after_the_join_is_kept_and_joined_on_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread that outlives the bounded join keeps its references, so a restart joins it."""
+    runner = _bare_runner(monkeypatch, tick_interval_s=TICK_S)
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, daemon=True)
+    stuck.start()
+    stop = threading.Event()
+    runner._ticker, runner._ticker_stop = stuck, stop
+    joins: list = []
+    real_join = stuck.join
+
+    def join(timeout=None):
+        joins.append(timeout)
+        if len(joins) == 2:
+            release.set()
+        real_join(timeout=0.01 if len(joins) == 1 else timeout)
+
+    stuck.join = join
+    try:
+        runner._stop_ticker()
+        assert stop.is_set()
+        assert joins == [5.0]
+        assert runner._ticker is stuck
+        assert runner._ticker_stop is stop
+
+        runner._start_ticker()
+        assert joins == [5.0, 5.0]
+        assert runner._ticker is not stuck
+        assert runner._ticker.is_alive()
+    finally:
+        release.set()
+        runner._stop_ticker()
+
+
+def test_without_an_interval_the_ticker_calls_are_no_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _bare_runner(monkeypatch)
+    threads_before = threading.active_count()
+
+    runner._start_ticker()
+    assert runner._ticker is None
+    assert threading.active_count() == threads_before
+    runner._stop_ticker()
+    assert runner._ticker is None
+
+
+def test_run_starts_the_ticker_and_stops_it_when_the_loop_ends() -> None:
+    runner = Runner.__new__(Runner)
+    runner.queue = Queue()
+    runner.queue.put(_item())
+    events: list[str] = []
+    runner._start_ticker = lambda: events.append("start")
+    runner._stop_ticker = lambda: events.append("stop")
+
+    def cycle(item: dict) -> None:
+        events.append("cycle")
+        raise KeyboardInterrupt
+
+    runner._run_cycle = cycle
+
+    with pytest.raises(KeyboardInterrupt):
+        runner._run()
+
+    assert events == ["start", "cycle", "stop"]
 
 
 def _runner_with_queue(protocol: list[str]) -> Runner:
@@ -359,6 +669,7 @@ def test_a_ca_variable_write_enqueues_no_jobs() -> None:
 
     item = _only_item(runner.queue)
     assert set(item) == QUEUE_ITEM_KEYS
+    assert item["tick"] is False
     assert item["values"]["input_a"]["value"] == 4.2
     assert len(item["done"]) == 1
     assert item["reset"] is False
@@ -373,7 +684,7 @@ def test_a_ca_reset_write_enqueues_no_jobs() -> None:
     assert driver.write(runner.reset_control_pv, 1) is True
 
     item = _only_item(runner.queue)
-    assert item == {"values": {}, "done": [], "reset": True, "jobs": []}
+    assert item == {"values": {}, "done": [], "reset": True, "jobs": [], "tick": False}
 
 
 def test_a_pva_reset_put_enqueues_no_jobs() -> None:
@@ -387,7 +698,7 @@ def test_a_pva_reset_put_enqueues_no_jobs() -> None:
     on_put(runner.providers["RESET"], op)
 
     item = _only_item(runner.queue)
-    assert item == {"values": {}, "done": [], "reset": True, "jobs": []}
+    assert item == {"values": {}, "done": [], "reset": True, "jobs": [], "tick": False}
 
 
 # --------------------------------------------------------------------------
@@ -692,6 +1003,221 @@ def test_batching_values_behind_a_jobs_only_item_runs_the_cycle_pass() -> None:
 
     assert events[0] == ("job", "a")
     assert _sets(events) == [{IN_X: 3.0}]
+
+
+# --------------------------------------------------------------------------
+# periodic passes: the run cycle takes ticks off the queue and merges them
+# --------------------------------------------------------------------------
+
+
+class _TickWatchingModel(CycleModel):
+    """``CycleModel`` that records the runner's ``_pass_is_tick`` at every
+    ``set`` and ``get``, so a test sees what the model itself would see."""
+
+    runner: Runner | None = None
+
+    def _get(self, names) -> dict[str, float]:
+        self.events.append(("tick_seen", self.runner._pass_is_tick))
+        return super()._get(names)
+
+    def _set(self, values: dict) -> None:
+        self.events.append(("tick_seen", self.runner._pass_is_tick))
+        super()._set(values)
+
+
+def _tick_cycle_runner(events: list, *, update_rate: float = 0.0) -> Runner:
+    """``_cycle_runner`` with the tick state ``__init__`` would create and a
+    model that reports ``_pass_is_tick`` from inside ``set``/``get``."""
+    runner = _cycle_runner(events, update_rate=update_rate)
+    runner._tick_lock = threading.Lock()
+    runner._tick_pending = False
+    runner._pass_is_tick = False
+    model = _TickWatchingModel(events)
+    model.runner = runner
+    runner.model = model
+    return runner
+
+
+def _tick_probe(events: list, runner: Runner):
+    """A job that records ``_pass_is_tick`` as the jobs of a cycle see it."""
+
+    def job() -> None:
+        events.append(("job_tick_seen", runner._pass_is_tick))
+
+    return job
+
+
+def _tick_seen(events: list) -> list:
+    return [event[1] for event in events if event[0] in ("tick_seen", "job_tick_seen")]
+
+
+def test_ticks_driven_by_hand_keep_at_most_one_queued() -> None:
+    """Ticks from a ticker faster than the loop pile up as one item; taking it
+    off the queue and running it frees the ticker to queue the next."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+
+    runner._tick()
+    runner._tick()
+    runner._tick()
+    assert runner.queue.qsize() == 1
+    assert runner._tick_pending is True
+
+    runner._run_cycle(runner.queue.get())
+
+    assert runner._tick_pending is False
+    assert runner.queue.empty()
+    runner._tick()
+    runner._tick()
+    assert runner.queue.qsize() == 1
+
+
+def test_a_tick_item_clears_the_pending_flag_at_the_top_of_the_cycle() -> None:
+    """The flag is already clear when the cycle's jobs run, so a tick raised
+    during a slow pass is queued rather than dropped."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick()
+    item = runner.queue.get()
+    flags: list = []
+    item["jobs"].append(lambda: flags.append(runner._tick_pending))
+
+    runner._run_cycle(item)
+
+    assert flags == [False]
+    assert runner._tick_pending is False
+
+
+def test_a_tick_merged_in_the_batching_window_does_not_stop_later_ticks() -> None:
+    """With ``update_rate=0.1`` a tick queued behind a write is merged into the
+    write's cycle. Merging it must clear the flag too, or the ticker would
+    believe a tick is still waiting and never queue another."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=0.1)
+    runner._enqueue({IN_X: _write(1.0, 2.0)})
+    runner._tick()
+    assert runner.queue.qsize() == 2
+
+    item = runner.queue.get()
+    runner._run_cycle(item)
+
+    assert runner.queue.empty()
+    assert runner._tick_pending is False
+    assert item["tick"] is True
+    assert _sets(events) == [{IN_X: 1.0}]
+    assert runner._pass_is_tick is False
+
+    runner._tick()
+    assert runner.queue.qsize() == 1
+    assert runner.queue.get()["tick"] is True
+
+
+def test_a_tick_merged_into_a_jobs_only_item_runs_the_pass_but_not_as_a_tick() -> None:
+    """Jobs alone skip the pass; a merged tick makes the batch publish. The
+    batch is not ticks alone, so ``_pass_is_tick`` stays false throughout."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._tick()
+
+    item = _item(jobs=[_tick_probe(events, runner)])
+    item["tick"] = False
+    runner._run_cycle(item)
+
+    assert item["tick"] is True
+    assert runner._tick_pending is False
+    assert _sets(events) == [{}]
+    assert _kinds(events)[-1] == "post"
+    assert _tick_seen(events) and not any(_tick_seen(events))
+    assert runner._pass_is_tick is False
+
+
+def test_the_start_up_item_merged_with_a_tick_publishes_but_not_as_a_tick() -> None:
+    """The start-up ``{}`` item is not a tick: merged with one, the pass runs
+    (it would anyway) and ``_pass_is_tick`` is false."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._enqueue({})
+    runner._tick()
+
+    runner._run_cycle(runner.queue.get())
+
+    assert _kinds(events)[-1] == "post"
+    assert _tick_seen(events) and not any(_tick_seen(events))
+    assert runner._pass_is_tick is False
+    assert runner._tick_pending is False
+
+
+def test_a_pure_tick_pass_is_visible_to_the_model_during_set_and_get() -> None:
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick()
+
+    runner._run_cycle(runner.queue.get())
+
+    assert _sets(events) == [{}]
+    assert _kinds(events)[-1] == "post"
+    seen = [event for event in events if event[0] == "tick_seen"]
+    assert len(seen) == 3  # snapshot get, set, output get
+    assert all(flag is True for _, flag in seen)
+    assert runner._pass_is_tick is True
+
+
+def test_a_pure_tick_batch_of_several_ticks_is_a_tick_pass() -> None:
+    """Every item of the batch a tick, no values, no reset: still a tick pass."""
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._tick()
+    runner._tick_pending = False
+    runner._tick()
+
+    runner._run_cycle(runner.queue.get())
+
+    assert runner.queue.empty()
+    assert runner._pass_is_tick is True
+    assert runner._tick_pending is False
+
+
+def test_a_tick_with_a_reset_is_not_a_tick_pass() -> None:
+    events: list = []
+    runner = _tick_cycle_runner(events, update_rate=BATCH_WINDOW)
+    runner._tick()
+    runner._enqueue({}, reset=True)
+
+    runner._run_cycle(runner.queue.get())
+
+    assert ("reset",) in events
+    assert runner._pass_is_tick is False
+
+
+def test_a_jobs_only_cycle_after_a_tick_pass_is_not_a_tick() -> None:
+    """``_pass_is_tick`` is reassigned every cycle, before the jobs run, so a
+    tick pass cannot leak its flag into the next cycle's jobs."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick()
+    runner._run_cycle(runner.queue.get())
+    assert runner._pass_is_tick is True
+    events.clear()
+
+    runner._run_cycle(_item(jobs=[_tick_probe(events, runner)]))
+
+    assert events == [("job_tick_seen", False)]
+    assert runner._pass_is_tick is False
+
+
+def test_an_item_without_a_tick_key_runs_the_cycle_as_before() -> None:
+    """Hand-built and subclass items may lack ``"tick"``: read as no tick."""
+    events: list = []
+    runner = _tick_cycle_runner(events)
+    runner._tick_pending = True
+    item = _item({IN_X: _write(1.0, 3.0)})
+
+    runner._run_cycle(item)
+
+    assert item["tick"] is False
+    assert runner._pass_is_tick is False
+    assert runner._tick_pending is True
+    assert _sets(events) == [{IN_X: 1.0}]
 
 
 # --------------------------------------------------------------------------
