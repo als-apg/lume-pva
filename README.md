@@ -195,6 +195,85 @@ An example configuration:
 }
 ```
 
+### Consumer contract
+
+A deployment that configures the runner, supplies its model, or subclasses it
+relies on the names and rules below. They are stable across patch releases;
+anything not listed here is an implementation detail.
+
+**Configuration keys.**
+
+* `config["variables"][name]["precision"]`: optional. Must be an `int` (not a
+  `bool`) in `0..17`, and is allowed only on a float scalar variable — a
+  `ScalarVariable` that is not an `IntVariable`. Int, bool, string, enum, array
+  and Torch variables reject it. A configured precision reaches CA as `prec`
+  and PVA as `display.precision`; a float without one keeps its previous
+  display fields, `display.format` included.
+* `config["variables"][name]["description"]`: optional. Must be a `str`, and is
+  allowed on scalar, int, string, bool and enum variables; array and Torch
+  variables reject it. Without one, the variable's own `description` is used
+  where the installed `lume-base` has it (0.6 and later). It reaches PVA as
+  `display.description`; an empty string means no description. The model's
+  variable is never modified.
+* `config["tick_interval_s"]`: optional. Absent or `None` means no periodic
+  passes. Otherwise it must be an `int` or `float` (not a `bool`), finite and
+  greater than zero, in seconds.
+
+Every violation raises `ValueError` from the `Runner` constructor, naming the
+variable and the key. A variable's `value_range` always comes from the model's
+Variable: a `value_range` key in the config entry is ignored.
+
+**The `output_severity` hook.** A model may define
+
+```py
+def output_severity(self, names: list[str]) -> dict[str, dict[str, str]]:
+    return {"some_output": {"condition": "udf"}}
+```
+
+It is called once per pass, on the run-loop thread, before anything is
+published, with the names of the outputs that pass publishes. Each name it
+reports `"udf"` is published as (INVALID, UDF) on both transports until a later
+pass stops reporting it. Only requested names are evaluated: keys outside
+`names` are ignored, so a model may report on outputs the pass does not
+publish. For a requested name, anything other than `{"condition": "udf"}` —
+an unknown condition, a non-dict entry, a reply that is not a dict — raises
+`ValueError`, nothing is published, and the pass fails as any failed pass does
+(the model rolls back and every waiting put completes with the error).
+
+Reporting a name undefined does not excuse its value. `model.get` validates
+every output against its variable before publishing starts, so an undefined
+output must still return a type-valid value: a float may be NaN, and an enum's
+value must be one of its options. An invalid value fails the pass.
+
+**Alarm-aware `_generate_value`.** `_generate_value(name, value, ts)` applies
+the UDF alarm to any name currently undefined, so a subclass publishing
+through it — its own echo, an extra post — carries the model's latest verdict
+without further work. `_pack_value` builds the same Value without that
+overlay. One race remains: a `_generate_value` called off the run-loop thread
+for a name, between the moment a pass records its new verdict and the moment
+that pass publishes the name, may carry the previous verdict. The next pass
+that publishes the name corrects it, which with `tick_interval_s` set happens
+within one tick.
+
+**Periodic-pass signals.** Every queued item carries `item["tick"]`: `False`
+for a write or reset, `True` for a periodic pass. Read it as
+`item.get("tick", False)`, since items a subclass builds may lack the key.
+During a pass, `self._pass_is_tick` is true only when every item of the batch
+was a tick and the batch carries no input values and no reset; it is set
+before the pass's jobs run, so `_cycle_output_names` and `_post_outputs` can
+read it. A subclass running with `update_rate` of zero may equally treat
+"input values present" as the mark of a write pass.
+
+**Intended wire changes.** Three differences a client can observe are
+deliberate:
+
+1. An `IntVariable` is served on PVA as an NTScalar `"i"` (int32, the width of
+   a CA `long`) rather than a double, and reads back as an integer.
+2. String and bool NTScalars and NTEnums carry a `display` block.
+3. When building a pass's outputs fails, nothing from that pass is published on
+   either transport. Previously a CA conversion error could leave part of the
+   pass published.
+
 ## Relationship to lume-pva
 
 This distribution exists so that changes can be exercised against a real
@@ -235,7 +314,7 @@ distribution retires once the upstream ones are merged and released.
 | Cover the configurations the constructor rejects | `generate_config` is documented as something to edit before passing on, so the `variables` table reaches the constructor hand-written: a name the model does not have, an unknown `mode`, or a writable PV over a read-only variable each serve a PV that accepts writes and drops them. Nothing exercised any of the validation. |
 | Cover the CA display limits for a variable with a non-default range | Every `ca_pvspec` case used a variable with no range and no unit, so a spec that dropped the limits, zeroed them, or swapped them was indistinguishable from a correct one. |
 | Apply the PV name prefix exactly once on the Channel Access path | `prefix` was written into the pvdb keys and then applied again by `SimpleServer.createPV`, so a runner configured with `PFX:` served `PFX:PFX:name`. The driver names a PV by its pvdb key, so the same mistake left the cycle's output pass calling `setParam` with a name the database did not hold: every cycle raised `KeyError` and was logged as a failed simulation. Keying the database by base name leaves the prefix to the server, which is also what names a PV in every driver callback. Invisible at `prefix=""`, which is what every existing test used. |
-| Serve an `IntVariable` as an int64 NTScalar on PVA | `IntVariable` subclasses `ScalarVariable`, and `create_type` tested for the base class first, so every integer variable was served as an NTScalar double and packed as a float. A PVA client saw a floating-point PV for an integer quantity; testing `IntVariable` first gives it wire code `l` and packs the value as an int. |
+| Serve an `IntVariable` as an int32 NTScalar on PVA | `IntVariable` subclasses `ScalarVariable`, and `create_type` tested for the base class first, so every integer variable was served as an NTScalar double and packed as a float. A PVA client saw a floating-point PV for an integer quantity; testing `IntVariable` first gives it wire code `i` and packs the value as an int. |
 | Configure a variable's display `precision` and `description` | A client had no way to learn how many digits a float is meaningful to, or what a PV is, other than out of band. Both are per-variable configuration keys validated at construction: `precision` (float scalars only) reaches CA as `prec` and PVA as `display.precision`, and `description` — or, without one, the variable's own — reaches PVA as `display.description` on every type with a display block. A float configured without a precision keeps the display fields it had before. |
 | Let a model mark outputs undefined for a cycle (`output_severity`) | A model whose calculation failed for some outputs but not others had no way to say so: the stale or placeholder value was published with no alarm, indistinguishable from a real one. A model defining `output_severity(names)` returns `{name: {"condition": "udf"}}` for the outputs it could not compute, and each is published as (INVALID, UDF) on both transports until a later cycle reports it defined again. The verdict is validated before anything is posted, so a malformed one fails the cycle rather than publishing half of it, and a CA put on an undefined variable restates the UDF alarm after its echo, since `setParam` would otherwise clear it. Names reported undefined must still carry values of their declared type. |
 | Run a periodic model pass (`tick_interval_s`) | A model that evolves on its own — a relaxation, a drifting source, anything driven by time rather than by writes — was evaluated only when a client wrote an input, so between writes its outputs stood still. With `tick_interval_s` set, a daemon thread queues a pass with no input values every that many seconds for as long as the run loop runs. At most one such pass is ever waiting, so a model slower than the interval runs back to back rather than building a backlog, and a tick merged into a batch of writes rides along with it. A subclass can tell a pure periodic pass from a write by `_pass_is_tick`. |
