@@ -601,12 +601,16 @@ class Runner:
 
         vars = []
         for k, v in self.model.supported_variables.items():
+            # Skip model variables that are not in the config, they are not served
+            c = self.config["variables"].get(k)
+            if c is None:
+                continue
             info = {
                 "name": v.name,
                 "read_only": v.read_only,
-                "pvname": self.config["variables"][k]["pv"],
+                "pvname": c["pv"],
                 "type": v.__class__.__name__,
-                "mode": self.config["variables"][k]["mode"],
+                "mode": c["mode"],
             }
             vars.append(info)
 
