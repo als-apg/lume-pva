@@ -68,6 +68,17 @@ try:
     from p4p.client.thread import Context
 
     from lume_pva_apg.runner import Runner
+    from lume_pva_apg.tests._mixed_model import (
+        MIXED_BOOL,
+        MIXED_DEFAULTS,
+        MIXED_ENUM,
+        MIXED_ENUM_OPTIONS,
+        MIXED_FLOAT_IN,
+        MIXED_FLOAT_OUT,
+        MIXED_INT,
+        MIXED_STR,
+        MixedModel,
+    )
 except ImportError as exc:
     skip_if_absent(exc)
 
@@ -170,16 +181,48 @@ class PolicyModel(LUMEModel):
         self.started.set()
 
 
-def _serve(tag: str, overrides: dict[str, Any], started: mpEvent, ready: mpEvent) -> None:
-    """Child-process entry point: serve a PolicyModel with `overrides` applied.
+# The models a server can be started with, each built as ``cls(tag=, started=)``.
+_MODELS: dict[str, Callable[..., LUMEModel]] = {
+    "policy": PolicyModel,
+    "mixed": MixedModel,
+}
+
+
+def _apply_overrides(config: dict[str, Any], overrides: dict[str, Any], tag: str) -> None:
+    """Merge `overrides` into a generated config.
+
+    Every key replaces the config's own, except ``variables``: that one maps a
+    *base* variable name -- tagged here, as the model tags it -- to the keys to
+    merge into that variable's generated entry, so a test can change one
+    variable's ``pv`` or ``mode`` without restating the rest of the config. A
+    name the model does not serve is an error rather than a new entry, so a
+    typo cannot pass as an override that did nothing.
+    """
+    overrides = dict(overrides)
+    for name, entry in overrides.pop("variables", {}).items():
+        key = _tagged(name, tag)
+        if key not in config["variables"]:
+            raise KeyError(f"override names {name!r}, which the model does not serve")
+        config["variables"][key].update(entry)
+    config.update(overrides)
+
+
+def _serve(
+    tag: str,
+    overrides: dict[str, Any],
+    started: mpEvent,
+    ready: mpEvent,
+    model_key: str = "policy",
+) -> None:
+    """Child-process entry point: serve the keyed model with `overrides` applied.
 
     Must be importable at module top level so the ``spawn`` start method can
     locate it. Blocks forever once ready; the parent terminates the process.
     """
-    model = PolicyModel(tag, started)
+    model = _MODELS[model_key](tag=tag, started=started)
     config = Runner.generate_config(model)
     config["update_rate"] = 0.0
-    config.update(overrides)
+    _apply_overrides(config, overrides, tag)
 
     runner = Runner(model=model, config=config)
     threading.Thread(target=runner._run, daemon=True).start()
@@ -198,14 +241,19 @@ def serve() -> Generator[Callable[..., Callable[[str], str]], None, None]:
 
     The factory returns the name mapper for that server: it turns a base
     variable name into the PV this particular test's runner serves it as.
+
+    ``serve(model="policy", **overrides)``: `model` picks the served model from
+    ``_MODELS``; keyword overrides replace config keys, and
+    ``variables={base_name: {...}}`` is merged into each named variable's
+    generated entry (see :func:`_apply_overrides`).
     """
     procs: list[Any] = []
 
-    def _start(**overrides: Any) -> Callable[[str], str]:
+    def _start(*, model: str = "policy", **overrides: Any) -> Callable[[str], str]:
         tag = f"_wp{next(_TAGS)}"
         started = _MP.Event()
         ready = _MP.Event()
-        proc = _MP.Process(target=_serve, args=(tag, overrides, started, ready), daemon=True)
+        proc = _MP.Process(target=_serve, args=(tag, overrides, started, ready, model), daemon=True)
         proc.start()
         procs.append(proc)
         assert ready.wait(timeout=OP_TIMEOUT), "child Runner never became ready"
@@ -658,3 +706,52 @@ def test_accepted_write_raises_no_alarm_even_with_alarms_enabled() -> None:
         ("updatePV", "input_a"),
         ("callbackPV", "input_a"),
     ]
+
+
+# --------------------------------------------------------------------------
+# harness: a mixed-type model, and per-variable config overrides
+# --------------------------------------------------------------------------
+
+
+def test_mixed_model_serves_every_type(serve) -> None:
+    """Float, int, bool, str and enum each reach a CA and a PVA client."""
+    p = serve(model="mixed")
+
+    assert _read(p(MIXED_FLOAT_IN)) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+    assert _read(p(MIXED_FLOAT_OUT)) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+    assert _read(p(MIXED_INT)) == MIXED_DEFAULTS[MIXED_INT]
+    assert _read(p(MIXED_BOOL)) == 1
+    str_value = epics.caget(p(MIXED_STR), as_string=True, use_monitor=False, timeout=OP_TIMEOUT)
+    assert str_value == MIXED_DEFAULTS[MIXED_STR]
+    enum_index = MIXED_ENUM_OPTIONS.index(MIXED_DEFAULTS[MIXED_ENUM])
+    assert _read(p(MIXED_ENUM)) == enum_index
+
+    with Context("pva") as ctx:
+
+        def raw(name: str) -> Any:
+            return ctx.get(p(name), timeout=OP_TIMEOUT).raw.value
+
+        assert raw(MIXED_FLOAT_IN) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_IN])
+        assert raw(MIXED_FLOAT_OUT) == pytest.approx(MIXED_DEFAULTS[MIXED_FLOAT_OUT])
+        assert raw(MIXED_INT) == MIXED_DEFAULTS[MIXED_INT]
+        assert raw(MIXED_BOOL) is True
+        assert raw(MIXED_STR) == MIXED_DEFAULTS[MIXED_STR]
+        assert list(raw(MIXED_ENUM).choices) == MIXED_ENUM_OPTIONS
+        assert raw(MIXED_ENUM).index == enum_index
+
+
+def test_variable_override_reaches_the_config(serve) -> None:
+    """``variables={name: {...}}`` changes that variable's entry and no other.
+
+    ``mode`` is honoured by the PVA handler, so an input overridden to ``ro``
+    refuses a PVA put while its unmodified neighbour still accepts one.
+    """
+    p = serve(variables={"input_a": {"mode": "ro"}})
+
+    with Context("pva") as ctx:
+        with pytest.raises(Exception, match="Read only PV"):
+            ctx.put(p("input_a"), 1.0, timeout=OP_TIMEOUT, wait=True)
+        ctx.put(p("input_b"), 2.0, timeout=OP_TIMEOUT, wait=True)
+
+        assert float(ctx.get(p("input_a"), timeout=OP_TIMEOUT)) == pytest.approx(0.0)
+        assert float(ctx.get(p("input_b"), timeout=OP_TIMEOUT)) == pytest.approx(2.0)
