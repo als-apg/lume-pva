@@ -122,3 +122,31 @@ def test_control_pvs_create_pva_sharedpvs_when_pva_enabled() -> None:
     assert "RESET" in runner.providers
     assert "SNAPSHOT" not in runner.pvdb
     assert "RESET" not in runner.pvdb
+
+
+def _make_runner_model_info_stub(model: StubModel, variables: dict) -> Runner:
+    runner = Runner.__new__(Runner)
+    runner.model = model
+    runner._config = {
+        "prefix": "",
+        "description": "stub",
+        "variables": variables,
+    }
+    runner.types = {}
+    runner.pvs = {}
+    runner.providers = {}
+    return runner
+
+
+def test_model_info_lists_only_configured_variables(model: StubModel) -> None:
+    # The config serves only one of the model's three variables
+    runner = _make_runner_model_info_stub(
+        model, {"input_a": {"name": "input_a", "pv": "input_a", "mode": "rw"}}
+    )
+
+    runner._create_model_info()
+
+    info = runner.pvs["MODEL_INFO"].current()
+    listed = [(v["name"], v["pvname"], v["mode"]) for v in info["supported_variables"]]
+    assert listed == [("input_a", "input_a", "rw")]
+    assert "MODEL_INFO" in runner.providers
