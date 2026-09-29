@@ -14,6 +14,13 @@ it by module path.
 Every variable name takes an optional ``tag`` suffix, so a harness that keeps
 its servers apart by variable name rather than by prefix can serve several of
 these side by side.
+
+Two knobs exercise the runner's ``output_severity`` handling. ``fail_mode``
+gives the model an ``output_severity`` hook -- absent when it is unset -- that
+misbehaves while the float input holds :data:`MIXED_SEVERITY_TRIGGER` and
+reports nothing otherwise, so a test can post a clean cycle, trigger, and then
+recover. ``extra_key`` makes ``_get`` return one key nobody requested, carrying
+a value no variable would accept.
 """
 
 from __future__ import annotations
@@ -48,6 +55,22 @@ MIXED_UNIT = "mm"
 MIXED_GAIN = 2.0
 MIXED_ENUM_OPTIONS = ["OFF", "ON", "STANDBY"]
 
+# While the float input holds this value, an output_severity hook acts on its
+# fail_mode. Inside MIXED_RANGE, but it doubles to a float output outside it.
+MIXED_SEVERITY_TRIGGER = -7.5
+# What output_severity may be asked to do while triggered: report the chosen
+# names undefined, raise, or reply with something that is not a valid reply.
+FAIL_UDF = "udf"
+FAIL_RAISE = "raise"
+FAIL_MALFORMED = "malformed"
+FAIL_MODES = (FAIL_UDF, FAIL_RAISE, FAIL_MALFORMED)
+# The names reported undefined in FAIL_UDF mode when a test chooses none.
+MIXED_DEFAULT_UDF = (MIXED_FLOAT_OUT, MIXED_INT)
+# The key extra_key adds to every _get reply, and the wrongly typed value it
+# carries. No variable is named this, so LUMEModel.get never validates it.
+MIXED_EXTRA_KEY = "mixed_extra"
+MIXED_EXTRA_VALUE = object()
+
 # Each variable's default. None is the zero value of its type, so a value read
 # back over the wire can only have come from the model, never from a zeroed record.
 MIXED_DEFAULTS: dict[str, Any] = {
@@ -70,11 +93,38 @@ class MixedModel(LUMEModel):
         wait for the runner's startup cycle. Optional for in-process use.
     tag : str
         Suffix appended to every variable name.
+    fail_mode : str | None
+        One of :data:`FAIL_MODES`: the model then defines ``output_severity``,
+        which while triggered reports ``udf_names`` undefined, raises, or
+        returns a malformed reply. ``None`` (the default) defines no hook.
+    udf_names : tuple[str, ...]
+        Base names (before ``tag``) reported undefined in ``FAIL_UDF`` mode.
+    extra_key : bool
+        Add :data:`MIXED_EXTRA_KEY` to every ``_get`` reply.
     """
 
-    def __init__(self, started: mpEvent | None = None, tag: str = "") -> None:
+    def __init__(
+        self,
+        started: mpEvent | None = None,
+        tag: str = "",
+        *,
+        fail_mode: str | None = None,
+        udf_names: tuple[str, ...] = MIXED_DEFAULT_UDF,
+        extra_key: bool = False,
+    ) -> None:
+        if fail_mode is not None and fail_mode not in FAIL_MODES:
+            raise ValueError(f"fail_mode must be one of {FAIL_MODES} or None, got {fail_mode!r}")
         self.tag = tag
         self.started = started
+        self.fail_mode = fail_mode
+        self.udf_names = tuple(f"{base}{tag}" for base in udf_names)
+        self.extra_key = extra_key
+        # Every names list output_severity was called with, in order.
+        self.severity_calls: list[list[str]] = []
+        # Defined per instance, so a model built without fail_mode has no
+        # output_severity attribute at all -- the runner's hook-less path.
+        if fail_mode is not None:
+            self.output_severity = self._output_severity
         self.float_in = f"{MIXED_FLOAT_IN}{tag}"
         self.float_out = f"{MIXED_FLOAT_OUT}{tag}"
         self._vars: dict[str, Variable] = {
@@ -125,7 +175,25 @@ class MixedModel(LUMEModel):
         return self._vars
 
     def _get(self, names) -> dict[str, Any]:
-        return {n: self._state[n] for n in names}
+        values = {n: self._state[n] for n in names}
+        if self.extra_key:
+            values[MIXED_EXTRA_KEY] = MIXED_EXTRA_VALUE
+        return values
+
+    @property
+    def triggered(self) -> bool:
+        """Whether the float input holds :data:`MIXED_SEVERITY_TRIGGER`."""
+        return float(self._state[self.float_in]) == MIXED_SEVERITY_TRIGGER
+
+    def _output_severity(self, names: list[str]) -> Any:
+        self.severity_calls.append(list(names))
+        if not self.triggered:
+            return {}
+        if self.fail_mode == FAIL_RAISE:
+            raise RuntimeError("output_severity cannot tell")
+        if self.fail_mode == FAIL_MALFORMED:
+            return {n: {"condition": "no-such-condition"} for n in self.udf_names}
+        return {n: {"condition": "udf"} for n in self.udf_names}
 
     def _set(self, values: dict[str, Any]) -> None:
         self._state.update({k: v for k, v in values.items() if k in self._state})
