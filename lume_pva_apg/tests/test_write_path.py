@@ -49,6 +49,7 @@ from typing import Any
 import pytest
 
 from lume_pva_apg.tests._requires import skip_if_absent
+from lume_pva_apg.tests._spawn import wait_until_ready
 
 # Keep all EPICS traffic on the loopback interface. Must be set before p4p,
 # pyepics, or the pcaspy server (created in Runner.__init__) initialise.
@@ -319,7 +320,7 @@ def serve() -> Generator[Callable[..., Callable[[str], str]], None, None]:
         )
         proc.start()
         procs.append(proc)
-        assert ready.wait(timeout=OP_TIMEOUT), "child Runner never became ready"
+        wait_until_ready(proc, ready)
         return lambda name: _tagged(name, tag)
 
     try:
