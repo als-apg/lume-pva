@@ -916,6 +916,34 @@ class Runner:
         """
         return ()
 
+    def _cycle_snapshot_names(self, written: Collection[str], reset: bool) -> list[str]:
+        """
+        Names read before ``model.set`` as the state a failed cycle rolls back to.
+
+        Called once per model pass, before the batch's reset and
+        ``model.set``. The base implementation names every settable variable,
+        which is right for any model: whatever the pass changes, setting those
+        values again undoes it. That read costs one ``model.get`` of the whole
+        settable state per pass, so a model with many inputs pays it on every
+        client write. A subclass whose model is restored by setting the
+        written variables back to their previous values narrows the snapshot
+        to them; a reset moves state no write names, so such a subclass keeps
+        the whole settable state for a pass that resets.
+
+        Parameters
+        ----------
+        written : Collection[str]
+            The variables this pass sets; empty for a tick or a bare reset.
+        reset : bool
+            Whether this pass resets the model before it sets.
+
+        Returns
+        -------
+        list[str] :
+            Settable variable names, each a key of ``model.supported_variables``.
+        """
+        return [key for key, var in self.model.supported_variables.items() if not var.read_only]
+
     def _cycle_output_names(self) -> list[str]:
         """
         Names of the variables read back from the model after each cycle.
@@ -1316,10 +1344,8 @@ class Runner:
                 latest_ts = time.time()
 
             # Stash previous state
-            settable_var_names = [
-                key for key, var in self.model.supported_variables.items() if not var.read_only
-            ]
-            self._set_cached_state(self.model.get(settable_var_names))
+            snapshot_names = self._cycle_snapshot_names(tuple(new_values), reset_requested)
+            self._set_cached_state(self.model.get(snapshot_names) if snapshot_names else {})
 
         # Set and simulate
         sim_error = None

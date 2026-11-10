@@ -146,6 +146,12 @@ subclass serving a channel whose every post is an event in its own right — a
 per-shot reading, a heartbeat — names it here, and may answer differently on
 every cycle. The default names none.
 
+`_cycle_snapshot_names(written, reset)` names what is read before `model.set`
+as the state a failed cycle rolls back to. The default is every settable
+variable, which costs one read of the whole settable state per pass. A subclass
+whose model is restored by setting the written variables back narrows it to
+them, and keeps the whole state for a pass that resets.
+
 ```py
 class CoHostedRunner(Runner):
     class Driver(Runner.CaDriver):
@@ -328,6 +334,7 @@ distribution retires once the upstream ones are merged and released.
 | Raise the `p4p` floor to `>=4.2.2` | The `pva` extra accepted any `p4p`, but 4.2.2 is the only release on which the runner's use of `form=True` has been verified, and it is the version OSPREY deployments lock. An unbounded requirement lets a resolver pick an older release that was never tested against the runner. |
 | Add a CI leg that runs the suite on `lume-base==0.5.0` | `lume-base` is an unpinned core dependency, so every other leg tests whatever release is newest that day, and a use of API an older release lacks passes CI and fails for a consumer whose environment is locked. Pinning 0.5.0 in the leg rather than in the metadata proves the oldest supported release still works while leaving consumers free to move. |
 | Force a Channel Access monitor event per post (`_ca_forced_names`) | pcaspy marks a PV for a monitor event only when its value or alarm changed, so a reading posted again at the same value never reaches a Channel Access monitor, although the same post is delivered on PVAccess. A consumer that counts posts — one sample per shot, a staleness watchdog on a steady reading — sees a constant value as silence. A subclass names the variables whose every post is an event; the default names none, so nothing changes for a runner that does not opt in. |
+| Let a subclass narrow the rollback snapshot (`_cycle_snapshot_names`) | Every model pass began by reading the whole settable state, so that a failed pass could be rolled back. On a model with tens of thousands of inputs that read dominates a client write, and a burst of writes holds the run loop for seconds. A subclass that knows its model is restored by the written variables alone names only those; the default still names every settable variable. |
 
 ### Fork-local changes
 

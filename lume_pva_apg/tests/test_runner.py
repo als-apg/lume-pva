@@ -1273,6 +1273,35 @@ def test_the_default_cycle_output_names_are_the_whole_roster() -> None:
     ]
 
 
+class _WrittenSnapshotRunner(Runner):
+    def _cycle_snapshot_names(self, written, reset) -> list[str]:
+        return super()._cycle_snapshot_names(written, reset) if reset else list(written)
+
+
+def test_the_default_snapshot_is_the_whole_settable_state() -> None:
+    runner = _wide_cycle_runner([])
+
+    assert runner._cycle_snapshot_names((), False) == [IN_X]
+    assert runner._cycle_snapshot_names((IN_X,), True) == [IN_X]
+
+
+def test_a_subclass_narrows_the_snapshot_and_a_pass_that_names_none_reads_none() -> None:
+    """A tick sets nothing, so a runner that snapshots only what a pass writes
+    reads nothing before it and caches an empty state."""
+    events: list = []
+    runner = _wide_cycle_runner(events, runner_cls=_WrittenSnapshotRunner)
+
+    runner._run_cycle(_item({IN_X: _write(1.0, 4.0)}))
+    assert events[:2] == [("get", (IN_X,)), ("set", {IN_X: 1.0})]
+    assert runner._cached_state == {IN_X: 0.0}
+
+    events.clear()
+    runner._run_cycle(_item())
+
+    assert [event for event in events if event[0] == "get"] == [("get", (IN_X, OUT_Y, OUT_Z))]
+    assert runner._cached_state == {}
+
+
 def test_a_subclass_narrows_the_post_cycle_get_to_its_names() -> None:
     """The hook narrows only the read that feeds the output step; the snapshot
     of the settable state a failed cycle rolls back to is taken as before."""
