@@ -326,6 +326,45 @@ class Runner:
         def __init__(self, runner: "Runner"):
             super().__init__()
             self.runner = runner
+            # The PVs marked for an update since the last flush. pcaspy keeps
+            # the mark on each PV and finds the marked ones by walking them
+            # all; this set lets updatePVs visit the marked ones alone.
+            self._marked: set[str] = set()
+            self._marked_lock = threading.Lock()
+
+        def _note_marked(self, reason) -> None:
+            if self.pvDB[reason].flag:
+                with self._marked_lock:
+                    self._marked.add(reason)
+
+        def setParam(self, reason, value, timestamp=None) -> None:
+            super().setParam(reason, value, timestamp)
+            self._note_marked(reason)
+
+        def setParamStatus(self, reason, alarm=None, severity=None) -> None:
+            super().setParamStatus(reason, alarm, severity)
+            self._note_marked(reason)
+
+        def setParamEnums(self, reason, enums, states=None) -> None:
+            super().setParamEnums(reason, enums, states)
+            self._note_marked(reason)
+
+        def setParamInfo(self, reason, info) -> None:
+            super().setParamInfo(reason, info)
+            self._note_marked(reason)
+
+        def updatePVs(self) -> None:
+            """
+            Post an update for every PV marked since the last flush.
+
+            The effect is pcaspy's own, at the cost of the marked PVs rather
+            than of every PV served: a post of a few names out of many
+            thousands no longer walks the whole table.
+            """
+            with self._marked_lock:
+                marked, self._marked = self._marked, set()
+            for reason in marked:
+                self.updatePV(reason)
 
         def forceEvent(self, reason) -> None:
             """
@@ -338,6 +377,7 @@ class Runner:
             data = self.pvDB[reason]
             data.mask |= pcaspy.cas.DBE_VALUE | pcaspy.cas.DBE_LOG
             data.flag = True
+            self._note_marked(reason)
 
         def write(self, reason, value) -> bool:
             if reason == self.runner.reset_control_pv:

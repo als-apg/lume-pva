@@ -2447,3 +2447,89 @@ def test_post_outputs_a_udf_failure_rolls_the_cycle_back_and_completes_puts() ->
     assert rolled_back == [True]
     assert len(completions) == 1 and "no-such-condition" in completions[0]
     assert [e[0] for e in events] == ["hook"]
+
+
+# --------------------------------------------------------------------------
+# CaDriver.updatePVs: a flush visits the marked PVs alone
+# --------------------------------------------------------------------------
+
+
+class _MarkingDriver(Runner.CaDriver):
+    """A CaDriver over a bare parameter table, with no pcaspy server behind it.
+
+    ``updatePV`` records the reason and clears the mark, as pcaspy's does.
+    """
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self.pvDB = {name: SimpleNamespace(flag=False, mask=0, value=0.0) for name in names}
+        self._marked = set()
+        self._marked_lock = threading.Lock()
+        self.updated: list[str] = []
+
+    def updatePV(self, reason) -> None:
+        self.updated.append(reason)
+        self.pvDB[reason].flag = False
+
+
+@pytest.fixture
+def marking_driver(monkeypatch: pytest.MonkeyPatch) -> _MarkingDriver:
+    import pcaspy
+
+    def set_param(self, reason, value, timestamp=None) -> None:
+        # pcaspy marks a PV only when its value changed
+        if self.pvDB[reason].value != value:
+            self.pvDB[reason].value = value
+            self.pvDB[reason].flag = True
+
+    def set_status(self, reason, alarm=None, severity=None) -> None:
+        self.pvDB[reason].flag = True
+
+    monkeypatch.setattr(pcaspy.Driver, "setParam", set_param)
+    monkeypatch.setattr(pcaspy.Driver, "setParamStatus", set_status)
+    return _MarkingDriver(("a", "b", "c", "d"))
+
+
+def test_update_pvs_visits_only_the_pvs_marked_since_the_last_flush(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("b", 1.0)
+    marking_driver.setParamStatus("d", 1, 1)
+
+    marking_driver.updatePVs()
+    assert sorted(marking_driver.updated) == ["b", "d"]
+
+    marking_driver.updatePVs()
+    assert sorted(marking_driver.updated) == ["b", "d"]
+
+
+def test_update_pvs_passes_over_a_set_param_that_changed_nothing(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("a", 0.0)
+
+    marking_driver.updatePVs()
+
+    assert marking_driver.updated == []
+
+
+def test_update_pvs_visits_a_forced_pv_whose_value_did_not_change(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("a", 0.0)
+    marking_driver.forceEvent("a")
+
+    marking_driver.updatePVs()
+
+    assert marking_driver.updated == ["a"]
+
+
+def test_update_pvs_visits_a_pv_marked_again_after_its_own_update(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("c", 2.0)
+    marking_driver.updatePV("c")
+    marking_driver.setParam("c", 3.0)
+
+    marking_driver.updatePVs()
+
+    assert marking_driver.updated == ["c", "c"]
