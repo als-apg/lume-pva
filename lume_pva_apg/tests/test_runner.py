@@ -1273,6 +1273,35 @@ def test_the_default_cycle_output_names_are_the_whole_roster() -> None:
     ]
 
 
+class _WrittenSnapshotRunner(Runner):
+    def _cycle_snapshot_names(self, written, reset) -> list[str]:
+        return super()._cycle_snapshot_names(written, reset) if reset else list(written)
+
+
+def test_the_default_snapshot_is_the_whole_settable_state() -> None:
+    runner = _wide_cycle_runner([])
+
+    assert runner._cycle_snapshot_names((), False) == [IN_X]
+    assert runner._cycle_snapshot_names((IN_X,), True) == [IN_X]
+
+
+def test_a_subclass_narrows_the_snapshot_and_a_pass_that_names_none_reads_none() -> None:
+    """A tick sets nothing, so a runner that snapshots only what a pass writes
+    reads nothing before it and caches an empty state."""
+    events: list = []
+    runner = _wide_cycle_runner(events, runner_cls=_WrittenSnapshotRunner)
+
+    runner._run_cycle(_item({IN_X: _write(1.0, 4.0)}))
+    assert events[:2] == [("get", (IN_X,)), ("set", {IN_X: 1.0})]
+    assert runner._cached_state == {IN_X: 0.0}
+
+    events.clear()
+    runner._run_cycle(_item())
+
+    assert [event for event in events if event[0] == "get"] == [("get", (IN_X, OUT_Y, OUT_Z))]
+    assert runner._cached_state == {}
+
+
 def test_a_subclass_narrows_the_post_cycle_get_to_its_names() -> None:
     """The hook narrows only the read that feeds the output step; the snapshot
     of the settable state a failed cycle rolls back to is taken as before."""
@@ -1989,6 +2018,9 @@ class _CaSpy:
     def setParamStatus(self, reason, alarm, severity) -> None:
         self.events.append(("setParamStatus", reason, alarm, severity))
 
+    def forceEvent(self, reason) -> None:
+        self.events.append(("forceEvent", reason))
+
     def updatePVs(self) -> None:
         if self.fail_update:
             raise RuntimeError("updatePVs refused")
@@ -2084,6 +2116,69 @@ def test_post_outputs_without_a_hook_posts_as_0_1_4() -> None:
     assert _set_params(events) == [_ca(n) for n in out]
     assert not [e for e in events if e[0] == "setParamStatus"]
     assert runner._udf == frozenset()
+
+
+def _forced(events: list) -> list:
+    return [e[1] for e in events if e[0] == "forceEvent"]
+
+
+def _forcing(runner: Runner, *names: str) -> Runner:
+    runner._ca_forced_names = lambda: names
+    return runner
+
+
+def test_post_outputs_forces_no_ca_event_by_default() -> None:
+    """The base runner names no forced variable, on either posting path."""
+    assert tuple(Runner.__new__(Runner)._ca_forced_names()) == ()
+    for model in (MixedModel(), MixedModel(fail_mode=FAIL_UDF)):
+        events: list = []
+        runner = _post_runner(model, events)
+
+        runner._post_outputs(_trigger(model), POST_TS)
+
+        assert _forced(events) == []
+
+
+def test_post_outputs_forces_a_ca_event_for_a_named_variable_without_a_hook() -> None:
+    """A forced name is marked after its own setParam and before updatePVs; no
+    other name is marked."""
+    events: list = []
+    model = MixedModel()
+    runner = _forcing(_post_runner(model, events), MIXED_FLOAT_OUT)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    assert _forced(events) == [_ca(MIXED_FLOAT_OUT)]
+    calls = [e[:2] for e in events if e[0] in ("setParam", "forceEvent", "updatePVs")]
+    at = calls.index(("forceEvent", _ca(MIXED_FLOAT_OUT)))
+    assert calls[at - 1] == ("setParam", _ca(MIXED_FLOAT_OUT))
+    assert calls[-1] == ("updatePVs",)
+
+
+def test_post_outputs_forces_a_ca_event_for_a_named_variable_with_a_hook() -> None:
+    """The severity path marks a forced name too, after its setParam and status."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _forcing(_post_runner(model, events), MIXED_FLOAT_OUT, MIXED_INT)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    assert sorted(_forced(events)) == sorted([_ca(MIXED_FLOAT_OUT), _ca(MIXED_INT)])
+    calls = [e[:2] for e in events if e[0] in ("setParam", "forceEvent", "updatePVs")]
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        assert calls.index(("setParam", _ca(name))) < calls.index(("forceEvent", _ca(name)))
+    assert calls[-1] == ("updatePVs",)
+
+
+def test_post_outputs_ignores_a_forced_name_the_cycle_does_not_post() -> None:
+    events: list = []
+    model = MixedModel()
+    runner = _forcing(_post_runner(model, events), MIXED_FLOAT_OUT)
+    out = {k: v for k, v in _trigger(model).items() if k != MIXED_FLOAT_OUT}
+
+    runner._post_outputs(out, POST_TS)
+
+    assert _forced(events) == []
 
 
 def test_post_outputs_without_a_hook_ignores_an_extra_key_as_0_1_4() -> None:
@@ -2352,3 +2447,89 @@ def test_post_outputs_a_udf_failure_rolls_the_cycle_back_and_completes_puts() ->
     assert rolled_back == [True]
     assert len(completions) == 1 and "no-such-condition" in completions[0]
     assert [e[0] for e in events] == ["hook"]
+
+
+# --------------------------------------------------------------------------
+# CaDriver.updatePVs: a flush visits the marked PVs alone
+# --------------------------------------------------------------------------
+
+
+class _MarkingDriver(Runner.CaDriver):
+    """A CaDriver over a bare parameter table, with no pcaspy server behind it.
+
+    ``updatePV`` records the reason and clears the mark, as pcaspy's does.
+    """
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self.pvDB = {name: SimpleNamespace(flag=False, mask=0, value=0.0) for name in names}
+        self._marked = set()
+        self._marked_lock = threading.Lock()
+        self.updated: list[str] = []
+
+    def updatePV(self, reason) -> None:
+        self.updated.append(reason)
+        self.pvDB[reason].flag = False
+
+
+@pytest.fixture
+def marking_driver(monkeypatch: pytest.MonkeyPatch) -> _MarkingDriver:
+    import pcaspy
+
+    def set_param(self, reason, value, timestamp=None) -> None:
+        # pcaspy marks a PV only when its value changed
+        if self.pvDB[reason].value != value:
+            self.pvDB[reason].value = value
+            self.pvDB[reason].flag = True
+
+    def set_status(self, reason, alarm=None, severity=None) -> None:
+        self.pvDB[reason].flag = True
+
+    monkeypatch.setattr(pcaspy.Driver, "setParam", set_param)
+    monkeypatch.setattr(pcaspy.Driver, "setParamStatus", set_status)
+    return _MarkingDriver(("a", "b", "c", "d"))
+
+
+def test_update_pvs_visits_only_the_pvs_marked_since_the_last_flush(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("b", 1.0)
+    marking_driver.setParamStatus("d", 1, 1)
+
+    marking_driver.updatePVs()
+    assert sorted(marking_driver.updated) == ["b", "d"]
+
+    marking_driver.updatePVs()
+    assert sorted(marking_driver.updated) == ["b", "d"]
+
+
+def test_update_pvs_passes_over_a_set_param_that_changed_nothing(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("a", 0.0)
+
+    marking_driver.updatePVs()
+
+    assert marking_driver.updated == []
+
+
+def test_update_pvs_visits_a_forced_pv_whose_value_did_not_change(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("a", 0.0)
+    marking_driver.forceEvent("a")
+
+    marking_driver.updatePVs()
+
+    assert marking_driver.updated == ["a"]
+
+
+def test_update_pvs_visits_a_pv_marked_again_after_its_own_update(
+    marking_driver: _MarkingDriver,
+) -> None:
+    marking_driver.setParam("c", 2.0)
+    marking_driver.updatePV("c")
+    marking_driver.setParam("c", 3.0)
+
+    marking_driver.updatePVs()
+
+    assert marking_driver.updated == ["c", "c"]
