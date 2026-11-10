@@ -1989,6 +1989,9 @@ class _CaSpy:
     def setParamStatus(self, reason, alarm, severity) -> None:
         self.events.append(("setParamStatus", reason, alarm, severity))
 
+    def forceEvent(self, reason) -> None:
+        self.events.append(("forceEvent", reason))
+
     def updatePVs(self) -> None:
         if self.fail_update:
             raise RuntimeError("updatePVs refused")
@@ -2084,6 +2087,69 @@ def test_post_outputs_without_a_hook_posts_as_0_1_4() -> None:
     assert _set_params(events) == [_ca(n) for n in out]
     assert not [e for e in events if e[0] == "setParamStatus"]
     assert runner._udf == frozenset()
+
+
+def _forced(events: list) -> list:
+    return [e[1] for e in events if e[0] == "forceEvent"]
+
+
+def _forcing(runner: Runner, *names: str) -> Runner:
+    runner._ca_forced_names = lambda: names
+    return runner
+
+
+def test_post_outputs_forces_no_ca_event_by_default() -> None:
+    """The base runner names no forced variable, on either posting path."""
+    assert tuple(Runner.__new__(Runner)._ca_forced_names()) == ()
+    for model in (MixedModel(), MixedModel(fail_mode=FAIL_UDF)):
+        events: list = []
+        runner = _post_runner(model, events)
+
+        runner._post_outputs(_trigger(model), POST_TS)
+
+        assert _forced(events) == []
+
+
+def test_post_outputs_forces_a_ca_event_for_a_named_variable_without_a_hook() -> None:
+    """A forced name is marked after its own setParam and before updatePVs; no
+    other name is marked."""
+    events: list = []
+    model = MixedModel()
+    runner = _forcing(_post_runner(model, events), MIXED_FLOAT_OUT)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    assert _forced(events) == [_ca(MIXED_FLOAT_OUT)]
+    calls = [e[:2] for e in events if e[0] in ("setParam", "forceEvent", "updatePVs")]
+    at = calls.index(("forceEvent", _ca(MIXED_FLOAT_OUT)))
+    assert calls[at - 1] == ("setParam", _ca(MIXED_FLOAT_OUT))
+    assert calls[-1] == ("updatePVs",)
+
+
+def test_post_outputs_forces_a_ca_event_for_a_named_variable_with_a_hook() -> None:
+    """The severity path marks a forced name too, after its setParam and status."""
+    events: list = []
+    model = MixedModel(fail_mode=FAIL_UDF)
+    runner = _forcing(_post_runner(model, events), MIXED_FLOAT_OUT, MIXED_INT)
+
+    runner._post_outputs(_trigger(model), POST_TS)
+
+    assert sorted(_forced(events)) == sorted([_ca(MIXED_FLOAT_OUT), _ca(MIXED_INT)])
+    calls = [e[:2] for e in events if e[0] in ("setParam", "forceEvent", "updatePVs")]
+    for name in (MIXED_FLOAT_OUT, MIXED_INT):
+        assert calls.index(("setParam", _ca(name))) < calls.index(("forceEvent", _ca(name)))
+    assert calls[-1] == ("updatePVs",)
+
+
+def test_post_outputs_ignores_a_forced_name_the_cycle_does_not_post() -> None:
+    events: list = []
+    model = MixedModel()
+    runner = _forcing(_post_runner(model, events), MIXED_FLOAT_OUT)
+    out = {k: v for k, v in _trigger(model).items() if k != MIXED_FLOAT_OUT}
+
+    runner._post_outputs(out, POST_TS)
+
+    assert _forced(events) == []
 
 
 def test_post_outputs_without_a_hook_ignores_an_extra_key_as_0_1_4() -> None:

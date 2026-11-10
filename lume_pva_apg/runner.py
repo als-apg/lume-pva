@@ -5,7 +5,7 @@ import os
 import platform
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from queue import Empty, Queue
 from types import MappingProxyType
 from typing import Any, NotRequired, TypedDict
@@ -326,6 +326,18 @@ class Runner:
         def __init__(self, runner: "Runner"):
             super().__init__()
             self.runner = runner
+
+        def forceEvent(self, reason) -> None:
+            """
+            Mark ``reason`` so the next ``updatePVs`` raises a monitor event for it.
+
+            ``setParam`` marks a PV only when its value or alarm changed, so a
+            value posted again unchanged reaches no monitor. Called after
+            ``setParam``, this marks the PV as a value update regardless.
+            """
+            data = self.pvDB[reason]
+            data.mask |= pcaspy.cas.DBE_VALUE | pcaspy.cas.DBE_LOG
+            data.flag = True
 
         def write(self, reason, value) -> bool:
             if reason == self.runner.reset_control_pv:
@@ -883,6 +895,27 @@ class Runner:
         self.pvs[pv] = SharedPV(initial=val)
         self.providers[f"{self.config['prefix']}{pv}"] = self.pvs[pv]
 
+    def _ca_forced_names(self) -> Collection[str]:
+        """
+        Names whose Channel Access post this cycle raises a monitor event even
+        when the value repeats.
+
+        Called once per :meth:`_post_outputs`. Channel Access raises a monitor
+        event only for a value or alarm that changed, so a reading posted again
+        at the same value is invisible to a monitoring client, while PVAccess
+        delivers every post. A subclass serving a channel whose every post is
+        an event in its own right -- a per-shot reading, a heartbeat -- names
+        it here. The base implementation names none, which is how every post
+        was published before this hook existed. A name the cycle does not post
+        is ignored.
+
+        Returns
+        -------
+        Collection[str] :
+            Variable names, each a key of ``model.supported_variables``.
+        """
+        return ()
+
     def _cycle_output_names(self) -> list[str]:
         """
         Names of the variables read back from the model after each cycle.
@@ -1363,6 +1396,8 @@ class Runner:
         ts : float
             Timestamp to stamp the published values with.
         """
+        forced = frozenset(self._ca_forced_names())
+
         if not callable(getattr(self.model, "output_severity", None)):
             LOG.debug(f"writing {len(out_values)} PVs")
             for k, v in out_values.items():
@@ -1393,6 +1428,8 @@ class Runner:
                         nv,
                         pcaspy.cas.epicsTimeStamp.fromPosixTimeStamp(ts),
                     )
+                    if k in forced:
+                        self.ca_driver.forceEvent(capv)
 
             if self.ca_driver is not None:
                 self.ca_driver.updatePVs()
@@ -1405,7 +1442,7 @@ class Runner:
         udf = self._evaluate_severity(names)
 
         pva_values: list[tuple[str, Any]] = []
-        ca_values: list[tuple[str, Any, bool]] = []
+        ca_values: list[tuple[str, Any, bool, bool]] = []
         for k in names:
             v = out_values[k]
             if v is None:
@@ -1438,7 +1475,7 @@ class Runner:
             capv = self.ca_pvs.get(k)
             if capv is not None and self.ca_driver is not None:
                 nv = self.pv_handlers[k].value_to_native(self.model.supported_variables[k], v)
-                ca_values.append((capv, nv, k in udf))
+                ca_values.append((capv, nv, k in udf, k in forced))
 
         # Names this cycle did not read keep their state.
         self._udf = (self._udf - set(names)) | udf
@@ -1454,7 +1491,7 @@ class Runner:
         if self.ca_driver is None:
             return
 
-        for capv, nv, is_udf in ca_values:
+        for capv, nv, is_udf, is_forced in ca_values:
             try:
                 self.ca_driver.setParam(
                     capv,
@@ -1464,6 +1501,8 @@ class Runner:
                 # setParam recomputes the alarm, so the UDF status follows it.
                 if is_udf:
                     self.ca_driver.setParamStatus(capv, *_UDF_CA)
+                if is_forced:
+                    self.ca_driver.forceEvent(capv)
             except Exception as e:
                 LOG.error(f"Error writing CA value for {capv}: {e}")
 
